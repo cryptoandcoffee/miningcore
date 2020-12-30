@@ -4,6 +4,14 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/coinfoundry/miningcore-docker.svg)]()
 [![license](https://img.shields.io/github/license/mashape/apistatus.svg)]()
 
+
+### Building and running with Docker
+
+git clone https://github.com/cryptoandcoffee/miningcore
+cd miningcore
+./start_from_scratch.sh
+
+
 ### Features
 
 - Supports clusters of pools each running individual currencies
