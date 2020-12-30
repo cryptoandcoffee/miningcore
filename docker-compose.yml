@@ -1,0 +1,17 @@
+version: '3.1'
+
+services:
+#  mp:
+#    image: cool
+
+  db:
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: yourpassword
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8080:8080
