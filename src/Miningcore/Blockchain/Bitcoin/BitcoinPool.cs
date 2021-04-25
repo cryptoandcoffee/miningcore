@@ -114,12 +114,12 @@ namespace Miningcore.Blockchain.Bitcoin
             var workerName = split?.Skip(1).FirstOrDefault()?.Trim() ?? string.Empty;
 
             // assumes that workerName is an address
-            context.IsAuthorized = !string.IsNullOrEmpty(minerName) && await manager.ValidateAddressAsync(minerName, ct);
+//          context.IsAuthorized = !string.IsNullOrEmpty(minerName) && await manager.ValidateAddressAsync(minerName, ct);
             context.Miner = minerName;
             context.Worker = workerName;
 
-            if(context.IsAuthorized)
-            {
+//            if(context.IsAuthorized)
+//           {
                 // respond
                 await client.RespondAsync(context.IsAuthorized, request.Id);
 
@@ -139,8 +139,8 @@ namespace Miningcore.Blockchain.Bitcoin
 
                     await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
                 }
-            }
-
+//            }
+/*
             else
             {
                 // respond
@@ -153,6 +153,7 @@ namespace Miningcore.Blockchain.Bitcoin
 
                 DisconnectClient(client);
             }
+*/
         }
 
         protected virtual async Task OnSubmitAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
