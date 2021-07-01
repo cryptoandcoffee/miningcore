@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -51,7 +31,7 @@ namespace Miningcore.Extensions
 
         public static BigInteger ToBigInteger(this Span<byte> value)
         {
-            return new BigInteger(value, true);
+            return new(value, true);
         }
 
         public static string ToHexString(this IEnumerable<byte> byteArray)
@@ -67,6 +47,44 @@ namespace Miningcore.Extensions
         public static string ToHexString(this Span<byte> value, bool withPrefix = false)
         {
             return ToHexString(value, null, null, withPrefix);
+        }
+
+        public static string ToHexString(this ReadOnlySpan<byte> value, bool withPrefix = false)
+        {
+            return ToHexString(value, null, null, withPrefix);
+        }
+
+        public static string ToHexString(this ReadOnlySpan<byte> value, int? off, int? len, bool withPrefix = false)
+        {
+            if(value == null || value.Length == 0)
+                return string.Empty;
+
+            var length = len ?? value.Length;
+            var bufferSize = length * 2;
+
+            if(withPrefix)
+                bufferSize += 2;
+
+            Span<char> buffer = stackalloc char[bufferSize];
+
+            var offset = 0;
+
+            if(withPrefix)
+            {
+                buffer[offset++] = '0';
+                buffer[offset++] = 'x';
+            }
+
+            var start = off ?? 0;
+
+            for(var i = start; i < length; i++)
+            {
+                var hex = HexStringTable[value[i]];
+                buffer[offset + i * 2 + 0] = hex[0];
+                buffer[offset + i * 2 + 1] = hex[1];
+            }
+
+            return new string(buffer);
         }
 
         public static string ToHexString(this Span<byte> value, int? off, int? len, bool withPrefix = false)
@@ -101,6 +119,7 @@ namespace Miningcore.Extensions
 
             return new string(buffer);
         }
+
 
         public static string ToHexString(this Memory<byte> value, bool withPrefix = false)
         {

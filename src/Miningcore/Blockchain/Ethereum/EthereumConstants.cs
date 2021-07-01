@@ -11,10 +11,10 @@ namespace Miningcore.Blockchain.Ethereum
         public const ulong DagSizeForTesting = 1024 * 32;
         public static BigInteger BigMaxValue = BigInteger.Pow(2, 256);
         public static double Pow2x32 = Math.Pow(2, 32);
-        public static BigInteger BigPow2x32 = new BigInteger(Pow2x32);
+        public static BigInteger BigPow2x32 = new(Pow2x32);
         public const int AddressLength = 20;
         public const decimal Wei = 1000000000000000000;
-        public static BigInteger WeiBig = new BigInteger(1000000000000000000);
+        public static BigInteger WeiBig = new(1000000000000000000);
         public const string EthereumStratumVersion = "EthereumStratum/1.0.0";
         public const decimal StaticTransactionFeeReserve = 0.0025m; // in ETH
         public const string BlockTypeUncle = "uncle";
@@ -25,64 +25,43 @@ namespace Miningcore.Blockchain.Ethereum
         public const int MinPayoutPeerCount = 1;
 #endif
 
-        public static readonly Regex ValidAddressPattern = new Regex("^0x[0-9a-fA-F]{40}$", RegexOptions.Compiled);
-        public static readonly Regex ZeroHashPattern = new Regex("^0?x?0+$", RegexOptions.Compiled);
-        public static readonly Regex NoncePattern = new Regex("^0x[0-9a-f]{16}$", RegexOptions.Compiled);
-        public static readonly Regex HashPattern = new Regex("^0x[0-9a-f]{64}$", RegexOptions.Compiled);
-        public static readonly Regex WorkerPattern = new Regex("^[0-9a-zA-Z-_]{1,8}$", RegexOptions.Compiled);
+        public static readonly Regex ValidAddressPattern = new("^0x[0-9a-fA-F]{40}$", RegexOptions.Compiled);
+        public static readonly Regex ZeroHashPattern = new("^0?x?0+$", RegexOptions.Compiled);
+        public static readonly Regex NoncePattern = new("^0x[0-9a-f]{16}$", RegexOptions.Compiled);
+        public static readonly Regex HashPattern = new("^0x[0-9a-f]{64}$", RegexOptions.Compiled);
+        public static readonly Regex WorkerPattern = new("^[0-9a-zA-Z-_]{1,64}$", RegexOptions.Compiled);
 
         public const ulong ByzantiumHardForkHeight = 4370000;
-        public const ulong  ConstantinopleHardForkHeight = 7280000;
+        public const ulong ConstantinopleHardForkHeight = 7280000;
         public const decimal HomesteadBlockReward = 5.0m;
         public const decimal ByzantiumBlockReward = 3.0m;
         public const decimal ConstantinopleReward = 2.0m;
-        public const decimal TestnetBlockReward = 3.0m;
-        public const decimal ExpanseBlockReward = 8.0m;
-        public const decimal EllaismBlockReward = 5.0m;
 
         public const int MinConfimations = 16;
     }
 
-    public class EthereumClassicConstants
-    {
-        public const decimal BaseRewardInitial = 5;
-        public const decimal BasePercent = 0.8m;
-        public const int BlockPerEra = 5000000;
-        public const decimal UnclePercent = 0.03125m;
-    }
-
+    // Callisto Monetary Policy
+    // https://github.com/EthereumCommonwealth/Roadmap/issues/56
     public class CallistoConstants
     {
-        public const decimal BaseRewardInitial = 600;
-        public const decimal TreasuryPercent = 0.3m;
+        public const decimal BaseRewardInitial = 77.76m;
+        public const decimal TreasuryPercent = 50m;
     }
 
     public enum EthereumNetworkType
     {
-        Main = 1,
-        Morden = 2,
+        Mainnet = 1,
         Ropsten = 3,
-        Rinkeby = 4,
-        Kovan = 42,
-        Galilei = 7919, // Callisto v3 Testnet
+        Callisto = 820,
 
         Unknown = -1,
     }
 
-    public enum ParityChainType
+    public enum GethChainType
     {
-        Foundation,
-        Olympic,
-        Frontier,
-        Homestead,
-        Mainnet,
-        Morden,
+        Ethereum,
         Ropsten,
-        Classic,
-        Expanse,
-        Ellaism,
-        CallistoTestnet, // Callisto (CLO) v3 Testnet
-        Callisto, // Callisto (CLO) v3 Testnet
+        Callisto,
 
         Unknown = -1,
     }
@@ -98,6 +77,7 @@ namespace Miningcore.Blockchain.Ethereum
         public const string GetAccounts = "eth_accounts";
         public const string GetPeerCount = "net_peerCount";
         public const string GetSyncState = "eth_syncing";
+        public const string GetBlockNumber = "eth_blockNumber";
         public const string GetBlockByNumber = "eth_getBlockByNumber";
         public const string GetBlockByHash = "eth_getBlockByHash";
         public const string GetUncleByBlockNumberAndIndex = "eth_getUncleByBlockNumberAndIndex";
@@ -105,9 +85,5 @@ namespace Miningcore.Blockchain.Ethereum
         public const string SendTx = "eth_sendTransaction";
         public const string UnlockAccount = "personal_unlockAccount";
         public const string Subscribe = "eth_subscribe";
-
-        public const string ParityVersion = "parity_versionInfo";
-        public const string ParityChain = "parity_chain";
-        public const string ParitySubscribe = "parity_subscribe";
     }
 }

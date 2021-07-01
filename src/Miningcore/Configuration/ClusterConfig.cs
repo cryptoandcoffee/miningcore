@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -26,6 +6,8 @@ using AspNetCoreRateLimit;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
+
+// ReSharper disable InconsistentNaming
 
 namespace Miningcore.Configuration
 {
@@ -108,7 +90,7 @@ namespace Miningcore.Configuration
         /// Coin Family associciations
         /// </summary>
         [JsonIgnore]
-        public static readonly Dictionary<CoinFamily, Type> Families = new Dictionary<CoinFamily, Type>
+        public static readonly Dictionary<CoinFamily, Type> Families = new()
         {
             {CoinFamily.Bitcoin, typeof(BitcoinTemplate)},
             {CoinFamily.Equihash, typeof(EquihashCoinTemplate)},
@@ -154,7 +136,7 @@ namespace Miningcore.Configuration
         public uint CoinbaseTxVersion { get; set; }
 
         /// <summary>
-        /// Default transaction comment for coins that REQUIRE tx comments 
+        /// Default transaction comment for coins that REQUIRE tx comments
         /// </summary>
         public string CoinbaseTxComment { get; set; }
 
@@ -167,6 +149,15 @@ namespace Miningcore.Configuration
         [JsonProperty(DefaultValueHandling = DefaultValueHandling.IgnoreAndPopulate)]
         [DefaultValue(1.0d)]
         public double ShareMultiplier { get; set; } = 1.0d;
+
+        [JsonProperty(DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public bool CoinbaseIgnoreAuxFlags { get; set; }
+
+        [JsonProperty(DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public bool IsPseudoPoS { get; set; }
+
+        [JsonProperty(DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public JToken BlockTemplateRpcExtraParams { get; set; }
 
         [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
         public Dictionary<string, BitcoinNetworkParams> Networks { get; set; }
@@ -190,6 +181,7 @@ namespace Miningcore.Configuration
             public string CoinbaseTxNetwork { get; set; }
 
             public bool PayFoundersReward { get; set; }
+            public bool PayFundingStream { get; set; }
 
             [JsonProperty(DefaultValueHandling = DefaultValueHandling.Ignore)]
             public decimal PercentFoundersReward { get; set; }
@@ -258,17 +250,8 @@ namespace Miningcore.Configuration
 
     public enum CryptonightHashType
     {
-        [EnumMember(Value = "cryptonight")]
-        Normal = 1,
-
-        [EnumMember(Value = "cryptonight-lite")]
-        Lite,
-
-        [EnumMember(Value = "cryptonight-heavy")]
-        Heavy,
-
-        [EnumMember(Value = "cryptonight-pico")]
-        Pico
+        [EnumMember(Value = "randomx")]
+        RandomX,
     }
 
     public partial class CryptonoteCoinTemplate : CoinTemplate
@@ -309,10 +292,22 @@ namespace Miningcore.Configuration
         public ulong AddressPrefixTestnet { get; set; }
 
         /// <summary>
+        /// Prefix of a valid stagenet-address
+        /// See: namespace config -> CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX in src/cryptonote_config.h
+        /// </summary>
+        public ulong AddressPrefixStagenet { get; set; }
+
+        /// <summary>
         /// Prefix of a valid integrated address
         /// See: namespace testnet -> CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX  in src/cryptonote_config.h
         /// </summary>
         public ulong AddressPrefixIntegrated { get; set; }
+
+        /// <summary>
+        /// Prefix of a valid integrated stagenet-address
+        /// See: namespace testnet -> CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX in src/cryptonote_config.h
+        /// </summary>
+        public ulong AddressPrefixIntegratedStagenet { get; set; }
 
         /// <summary>
         /// Prefix of a valid integrated testnet-address
@@ -346,9 +341,11 @@ namespace Miningcore.Configuration
 
     public enum PayoutScheme
     {
-        // ReSharper disable once InconsistentNaming
         PPLNS = 1,
-        Solo
+        PROP = 2,
+        SOLO = 3,
+        PPS = 4,
+        PPBS = 5,
     }
 
     public partial class ClusterLoggingConfig
@@ -385,11 +382,6 @@ namespace Miningcore.Configuration
         /// Use HTTP2 protocol for RPC requests (don't use this unless your daemon(s) live behind a HTTP reverse proxy)
         /// </summary>
         public bool Http2 { get; set; }
-
-        /// <summary>
-        /// Set if the endpoint requires HTTP Digest Authentication (Cryptonote coins)
-        /// </summary>
-        public bool DigestAuth { get; set; }
 
         /// <summary>
         /// Optional endpoint category
@@ -533,7 +525,10 @@ namespace Miningcore.Configuration
         public bool Enabled { get; set; }
         public int Interval { get; set; }
 
-        public string ShareRecoveryFile { get; set; }
+        /// <summary>
+        /// Indentifier used in coinbase transactions to identify the pool
+        /// </summary>
+        public string CoinbaseString  { get; set; }
     }
 
     public partial class PersistenceConfig
@@ -654,6 +649,37 @@ namespace Miningcore.Configuration
         public string SharedEncryptionKey { get; set; }
     }
 
+    public partial class Statistics
+    {
+        /// <summary>
+        /// Statistics update interval in seconds
+        /// </summary>
+        public int? UpdateInterval { get; set; }
+
+        /// <summary>
+        /// Time window of shares to take into account when calculating - in minutes
+        /// </summary>
+        public int? HashrateCalculationWindow { get; set; }
+
+        /// <summary>
+        /// Stats cleanup interval in hours
+        /// </summary>
+        public int? GcInterval { get; set; }
+
+        /// <summary>
+        /// Time window in days of stats to discard when cleaning up periodically
+        /// </summary>
+        public int? CleanupDays { get; set; }
+
+    }
+    public class NicehashClusterConfig
+    {
+        /// <summary>
+        /// If set to true, the Nicehash service will be started
+        /// </summary>
+        public bool EnableAutoDiff { get; set; }
+    }
+
     public partial class PoolConfig
     {
         /// <summary>
@@ -678,7 +704,7 @@ namespace Miningcore.Configuration
         public PoolShareBasedBanningConfig Banning { get; set; }
         public RewardRecipient[] RewardRecipients { get; set; }
         public string Address { get; set; }
-        public string PubKey { get; set; }  // POS coins only 
+        public string PubKey { get; set; }  // POS coins only
         public int ClientConnectionTimeout { get; set; }
         public int JobRebroadcastTimeout { get; set; }
         public int BlockRefreshInterval { get; set; }
@@ -698,6 +724,11 @@ namespace Miningcore.Configuration
     public partial class ClusterConfig
     {
         /// <summary>
+        /// cluster instance id (only used in clustering setups)
+        /// </summary>
+        public byte? InstanceId { get; set; }
+
+        /// <summary>
         /// One or more files containing coin definitions
         /// </summary>
         public string[] CoinTemplates { get; set; }
@@ -709,6 +740,8 @@ namespace Miningcore.Configuration
         public ClusterPaymentProcessingConfig PaymentProcessing { get; set; }
         public NotificationsConfig Notifications { get; set; }
         public ApiConfig Api { get; set; }
+        public Statistics Statistics { get; set; }
+        public NicehashClusterConfig Nicehash { get; set; }
 
         /// <summary>
         /// If this is enabled, shares are not written to the database
@@ -727,6 +760,8 @@ namespace Miningcore.Configuration
         /// Increasing this value by one, increases pool peak memory consumption by 1 GB
         /// </summary>
         public int? EquihashMaxThreads { get; set; }
+
+        public string ShareRecoveryFile { get; set; }
 
         public PoolConfig[] Pools { get; set; }
     }

@@ -33,7 +33,6 @@ namespace Miningcore.Blockchain.Equihash
             IMessageBus messageBus,
             IExtraNonceProvider extraNonceProvider) : base(ctx, clock, messageBus, extraNonceProvider)
         {
-            getBlockTemplateParams = null;
         }
 
         private EquihashCoinTemplate coin;
@@ -42,7 +41,7 @@ namespace Miningcore.Blockchain.Equihash
 
         protected override void PostChainIdentifyConfigure()
         {
-            ChainConfig = coin.GetNetwork(network.NetworkType);
+            ChainConfig = coin.GetNetwork(network.ChainName);
             solver = EquihashSolverFactory.GetSolver(ctx, ChainConfig.Solver);
 
             base.PostChainIdentifyConfigure();
@@ -55,7 +54,7 @@ namespace Miningcore.Blockchain.Equihash
             var subsidyResponse = await daemon.ExecuteCmdAnyAsync<ZCashBlockSubsidy>(logger, BitcoinCommands.GetBlockSubsidy);
 
             var result = await daemon.ExecuteCmdAnyAsync<EquihashBlockTemplate>(logger,
-                BitcoinCommands.GetBlockTemplate, extraPoolConfig?.GBTArgs ?? (object) getBlockTemplateParams);
+                BitcoinCommands.GetBlockTemplate, extraPoolConfig?.GBTArgs ?? (object) GetBlockTemplateParams());
 
             if(subsidyResponse.Error == null && result.Error == null && result.Response != null)
                 result.Response.Subsidy = subsidyResponse.Response;
@@ -164,6 +163,14 @@ namespace Miningcore.Blockchain.Equihash
                         BlockchainStats.NextNetworkBits = blockTemplate.Bits;
                     }
 
+                    else
+                    {
+                        if(via != null)
+                            logger.Debug(() => $"Template update {blockTemplate.Height} [{via}]");
+                        else
+                            logger.Debug(() => $"Template update {blockTemplate.Height}");
+                    }
+
                     currentJob = job;
                 }
 
@@ -208,7 +215,7 @@ namespace Miningcore.Blockchain.Equihash
             return result.Response != null && result.Response.IsValid;
         }
 
-        public override object[] GetSubscriberData(StratumClient worker)
+        public override object[] GetSubscriberData(StratumConnection worker)
         {
             Contract.RequiresNonNull(worker, nameof(worker));
 
@@ -226,7 +233,7 @@ namespace Miningcore.Blockchain.Equihash
             return responseData;
         }
 
-        public override async ValueTask<Share> SubmitShareAsync(StratumClient worker, object submission,
+        public override async ValueTask<Share> SubmitShareAsync(StratumConnection worker, object submission,
             double stratumDifficultyBase, CancellationToken ct)
         {
             Contract.RequiresNonNull(worker, nameof(worker));

@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -71,7 +51,7 @@ namespace Miningcore.Blockchain.Bitcoin
         protected bool hasLegacyDaemon;
         protected BitcoinPoolConfigExtra extraPoolConfig;
         protected BitcoinPoolPaymentProcessingConfigExtra extraPoolPaymentProcessingConfig;
-        protected readonly List<TJob> validJobs = new List<TJob>();
+        protected readonly List<TJob> validJobs = new();
         protected DateTime? lastJobRebroadcast;
         protected bool hasSubmitBlockMethod;
         protected bool isPoS;
@@ -79,13 +59,16 @@ namespace Miningcore.Blockchain.Bitcoin
         protected Network network;
         protected IDestination poolAddressDestination;
 
-        protected object[] getBlockTemplateParams =
+        protected virtual object[] GetBlockTemplateParams()
         {
-            new
+            return new object[]
             {
-                rules = new[] { "segwit" }
-            }
-        };
+                new
+                {
+                    rules = new[] {"segwit"},
+                }
+            };
+        }
 
         protected virtual void SetupJobUpdates()
         {
@@ -323,7 +306,7 @@ namespace Miningcore.Blockchain.Bitcoin
             if(responses.Where(x => x.Error?.InnerException?.GetType() == typeof(DaemonClientException))
                 .Select(x => (DaemonClientException) x.Error.InnerException)
                 .Any(x => x.Code == HttpStatusCode.Unauthorized))
-                logger.ThrowLogPoolStartupException($"Daemon reports invalid credentials");
+                logger.ThrowLogPoolStartupException("Daemon reports invalid credentials");
 
             return responses.All(x => x.Error == null);
         }
@@ -412,7 +395,7 @@ namespace Miningcore.Blockchain.Bitcoin
             if(responses.Where(x => x.Error?.InnerException?.GetType() == typeof(DaemonClientException))
                 .Select(x => (DaemonClientException) x.Error.InnerException)
                 .Any(x => x.Code == HttpStatusCode.Unauthorized))
-                logger.ThrowLogPoolStartupException($"Daemon reports invalid credentials");
+                logger.ThrowLogPoolStartupException("Daemon reports invalid credentials");
 
             return responses.All(x => x.Error == null);
         }
@@ -434,19 +417,19 @@ namespace Miningcore.Blockchain.Bitcoin
             while(true)
             {
                 var responses = await daemon.ExecuteCmdAllAsync<BlockTemplate>(logger,
-                    BitcoinCommands.GetBlockTemplate, getBlockTemplateParams);
+                    BitcoinCommands.GetBlockTemplate, GetBlockTemplateParams());
 
                 var isSynched = responses.All(x => x.Error == null);
 
                 if(isSynched)
                 {
-                    logger.Info(() => $"All daemons synched with blockchain");
+                    logger.Info(() => "All daemons synched with blockchain");
                     break;
                 }
 
                 if(!syncPendingNotificationShown)
                 {
-                    logger.Info(() => $"Daemons still syncing with network. Manager will be started once synced");
+                    logger.Info(() => "Daemons still syncing with network. Manager will be started once synced");
                     syncPendingNotificationShown = true;
                 }
 
@@ -465,6 +448,7 @@ namespace Miningcore.Blockchain.Bitcoin
                 new DaemonCmd(BitcoinCommands.SubmitBlock),
                 new DaemonCmd(!hasLegacyDaemon ? BitcoinCommands.GetBlockchainInfo : BitcoinCommands.GetInfo),
                 new DaemonCmd(BitcoinCommands.GetDifficulty),
+                new DaemonCmd(BitcoinCommands.GetAddressInfo, new[] { poolConfig.Address }),
             };
 
             var results = await daemon.ExecuteBatchAnyAsync(logger, commands);
@@ -472,7 +456,11 @@ namespace Miningcore.Blockchain.Bitcoin
             if(results.Any(x => x.Error != null))
             {
                 var resultList = results.ToList();
-                var errors = results.Where(x => x.Error != null && commands[resultList.IndexOf(x)].Method != BitcoinCommands.SubmitBlock)
+
+                // filter out optional RPCs
+                var errors = results
+                    .Where(x => x.Error != null && commands[resultList.IndexOf(x)].Method != BitcoinCommands.SubmitBlock)
+                    .Where(x => x.Error != null && commands[resultList.IndexOf(x)].Method != BitcoinCommands.GetAddressInfo)
                     .ToArray();
 
                 if(errors.Any())
@@ -485,6 +473,7 @@ namespace Miningcore.Blockchain.Bitcoin
             var blockchainInfoResponse = !hasLegacyDaemon ? results[2].Response.ToObject<BlockchainInfo>() : null;
             var daemonInfoResponse = hasLegacyDaemon ? results[2].Response.ToObject<DaemonInfo>() : null;
             var difficultyResponse = results[3].Response.ToObject<JToken>();
+            var addressInfoResponse = results[4].Error == null ? results[4].Response.ToObject<AddressInfo>() : null;
 
             // chain detection
             if(!hasLegacyDaemon)
@@ -495,14 +484,20 @@ namespace Miningcore.Blockchain.Bitcoin
             PostChainIdentifyConfigure();
 
             // ensure pool owns wallet
-            if(validateAddressResponse == null || !validateAddressResponse.IsValid)
+            if(validateAddressResponse is not {IsValid: true})
                 logger.ThrowLogPoolStartupException($"Daemon reports pool-address '{poolConfig.Address}' as invalid");
 
-            isPoS = difficultyResponse.Values().Any(x => x.Path == "proof-of-stake");
+            isPoS = poolConfig.Template is BitcoinTemplate {IsPseudoPoS: true} || difficultyResponse.Values().Any(x => x.Path == "proof-of-stake");
 
             // Create pool address script from response
             if(!isPoS)
+            {
+                if(extraPoolConfig?.AddressType != BitcoinAddressType.Legacy)
+                    logger.Info(()=> $"Interpreting pool address {poolConfig.Address} as type {extraPoolConfig?.AddressType.ToString()}");
+
                 poolAddressDestination = AddressToDestination(poolConfig.Address, extraPoolConfig?.AddressType);
+            }
+
             else
                 poolAddressDestination = new PubKey(poolConfig.PubKey ?? validateAddressResponse.PubKey);
 
@@ -526,7 +521,7 @@ namespace Miningcore.Blockchain.Bitcoin
             else if(submitBlockResponse.Error?.Code == -1)
                 hasSubmitBlockMethod = true;
             else
-                logger.ThrowLogPoolStartupException($"Unable detect block submission RPC method");
+                logger.ThrowLogPoolStartupException("Unable detect block submission RPC method");
 
             if(!hasLegacyDaemon)
                 await UpdateNetworkStatsAsync();
@@ -564,6 +559,9 @@ namespace Miningcore.Blockchain.Bitcoin
                 case BitcoinAddressType.BechSegwit:
                     return BitcoinUtils.BechSegwitAddressToDestination(poolConfig.Address, network);
 
+                case BitcoinAddressType.BCash:
+                    return BitcoinUtils.BCashAddressToDestination(poolConfig.Address, network);
+
                 default:
                     return BitcoinUtils.AddressToDestination(poolConfig.Address, network);
             }
@@ -580,7 +578,7 @@ namespace Miningcore.Blockchain.Bitcoin
         protected void ConfigureRewards()
         {
             // Donation to MiningCore development
-            if(network.NetworkType == NetworkType.Mainnet &&
+            if(network.ChainName == ChainName.Mainnet &&
                 DevDonation.Addresses.TryGetValue(poolConfig.Template.Symbol, out var address))
             {
                 poolConfig.RewardRecipients = poolConfig.RewardRecipients.Concat(new[]
@@ -599,7 +597,7 @@ namespace Miningcore.Blockchain.Bitcoin
 
         public Network Network => network;
         public IObservable<object> Jobs { get; private set; }
-        public BlockchainStats BlockchainStats { get; } = new BlockchainStats();
+        public BlockchainStats BlockchainStats { get; } = new();
 
         public override void Configure(PoolConfig poolConfig, ClusterConfig clusterConfig)
         {
@@ -621,12 +619,12 @@ namespace Miningcore.Blockchain.Bitcoin
             var result = await daemon.ExecuteCmdAnyAsync<ValidateAddressResponse>(logger, ct,
                 BitcoinCommands.ValidateAddress, new[] { address });
 
-            return result.Response != null && result.Response.IsValid;
+            return result.Response is {IsValid: true};
         }
 
-        public abstract object[] GetSubscriberData(StratumClient worker);
+        public abstract object[] GetSubscriberData(StratumConnection worker);
 
-        public abstract ValueTask<Share> SubmitShareAsync(StratumClient worker, object submission,
+        public abstract ValueTask<Share> SubmitShareAsync(StratumConnection worker, object submission,
             double stratumDifficultyBase, CancellationToken ct);
 
         #endregion // API-Surface

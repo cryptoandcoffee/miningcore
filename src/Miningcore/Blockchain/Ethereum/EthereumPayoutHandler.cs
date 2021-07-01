@@ -1,27 +1,6 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Globalization;
 using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
@@ -34,8 +13,6 @@ using Miningcore.Configuration;
 using Miningcore.DaemonInterface;
 using Miningcore.Extensions;
 using Miningcore.Messaging;
-using Miningcore.Notifications;
-using Miningcore.Notifications.Messages;
 using Miningcore.Payments;
 using Miningcore.Persistence;
 using Miningcore.Persistence.Model;
@@ -75,11 +52,10 @@ namespace Miningcore.Blockchain.Ethereum
         private readonly IComponentContext ctx;
         private DaemonClient daemon;
         private EthereumNetworkType networkType;
-        private ParityChainType chainType;
+        private GethChainType chainType;
         private const int BlockSearchOffset = 50;
         private EthereumPoolConfigExtra extraPoolConfig;
         private EthereumPoolPaymentProcessingConfigExtra extraConfig;
-        private bool isParity = true;
 
         protected override string LogCategory => "Ethereum Payout Handler";
 
@@ -138,10 +114,6 @@ namespace Miningcore.Blockchain.Ethereum
                     var blockInfo = blockInfos[j];
                     var block = page[j];
 
-                    // extract confirmation data from stored block
-                    var mixHash = block.TransactionConfirmationData.Split(":").First();
-                    var nonce = block.TransactionConfirmationData.Split(":").Last();
-
                     // update progress
                     block.ConfirmationProgress = Math.Min(1.0d, (double) (latestBlockHeight - block.BlockHeight) / EthereumConstants.MinConfimations);
                     result.Add(block);
@@ -151,17 +123,13 @@ namespace Miningcore.Blockchain.Ethereum
                     // is it block mined by us?
                     if(string.Equals(blockInfo.Miner, poolConfig.Address, StringComparison.OrdinalIgnoreCase))
                     {
-                        // additional check
-                        // NOTE: removal of first character of both sealfields caused by
-                        // https://github.com/paritytech/parity/issues/1090
-                        var match = isParity ?
-                            true :
-                            blockInfo.SealFields[0].Substring(2) == mixHash &&
-                            blockInfo.SealFields[1].Substring(2) == nonce;
-
                         // mature?
-                        if(match && (latestBlockHeight - block.BlockHeight >= EthereumConstants.MinConfimations))
+                        if(latestBlockHeight - block.BlockHeight >= EthereumConstants.MinConfimations)
                         {
+                            var blockHashResponses = await daemon.ExecuteCmdAllAsync<DaemonResponses.Block>(logger, EC.GetBlockByNumber, new[] { (object) block.BlockHeight.ToStringHexWithPrefix(), true });
+                            var blockHash = blockHashResponses.First(x => x.Error == null && x.Response?.Hash != null).Response.Hash;
+
+                            block.Hash = blockHash;
                             block.Status = BlockStatus.Confirmed;
                             block.ConfirmationProgress = 1;
                             block.BlockHeight = (ulong) blockInfo.Height;
@@ -218,6 +186,10 @@ namespace Miningcore.Blockchain.Ethereum
                                 // mature?
                                 if(latestBlockHeight - uncle.Height.Value >= EthereumConstants.MinConfimations)
                                 {
+                                    var blockHashUncleResponses = await daemon.ExecuteCmdAllAsync<DaemonResponses.Block>(logger, EC.GetBlockByNumber, new[] { (object) uncle.Height.Value.ToStringHexWithPrefix(), true });
+                                    var blockHashUncle = blockHashUncleResponses.First(x => x.Error == null && x.Response?.Hash != null).Response.Hash;
+
+                                    block.Hash = blockHashUncle;
                                     block.Status = BlockStatus.Confirmed;
                                     block.ConfirmationProgress = 1;
                                     block.Reward = GetUncleReward(chainType, uncle.Height.Value, blockInfo2.Height.Value);
@@ -240,6 +212,7 @@ namespace Miningcore.Blockchain.Ethereum
                     if(block.Status == BlockStatus.Pending && block.ConfirmationProgress > 0.75)
                     {
                         // we've lost this one
+                        block.Hash = "0x0";
                         block.Status = BlockStatus.Orphaned;
                         block.Reward = 0;
 
@@ -273,7 +246,7 @@ namespace Miningcore.Blockchain.Ethereum
             // ensure we have peers
             var infoResponse = await daemon.ExecuteCmdSingleAsync<string>(logger, EC.GetPeerCount);
 
-            if(networkType == EthereumNetworkType.Main &&
+            if(networkType == EthereumNetworkType.Mainnet &&
                 (infoResponse.Error != null || string.IsNullOrEmpty(infoResponse.Response) ||
                     infoResponse.Response.IntegralFromHex<int>() < EthereumConstants.MinPayoutPeerCount))
             {
@@ -333,36 +306,21 @@ namespace Miningcore.Blockchain.Ethereum
             return blockHeights.Select(x => blockCache[x]).ToArray();
         }
 
-        internal static decimal GetBaseBlockReward(ParityChainType chainType, ulong height)
+        internal static decimal GetBaseBlockReward(GethChainType chainType, ulong height)
         {
             switch(chainType)
             {
-                case ParityChainType.Mainnet:
-                    if (height >= EthereumConstants.ConstantinopleHardForkHeight)
+                case GethChainType.Ethereum:
+                    if(height >= EthereumConstants.ConstantinopleHardForkHeight)
                         return EthereumConstants.ConstantinopleReward;
+
                     if(height >= EthereumConstants.ByzantiumHardForkHeight)
                         return EthereumConstants.ByzantiumBlockReward;
 
                     return EthereumConstants.HomesteadBlockReward;
 
-                case ParityChainType.Classic:
-                    {
-                        var era = Math.Floor(((double) height + 1) / EthereumClassicConstants.BlockPerEra);
-                        return (decimal) Math.Pow((double) EthereumClassicConstants.BasePercent, era) * EthereumClassicConstants.BaseRewardInitial;
-                    }
-
-                case ParityChainType.Expanse:
-                    return EthereumConstants.ExpanseBlockReward;
-
-                case ParityChainType.Ellaism:
-                    return EthereumConstants.EllaismBlockReward;
-
-                case ParityChainType.Ropsten:
-                    return EthereumConstants.ByzantiumBlockReward;
-
-                case ParityChainType.CallistoTestnet:
-                case ParityChainType.Callisto:
-                    return CallistoConstants.BaseRewardInitial * (1.0m - CallistoConstants.TreasuryPercent);
+                case GethChainType.Callisto:
+                    return CallistoConstants.BaseRewardInitial * (CallistoConstants.TreasuryPercent / 100);
 
                 default:
                     throw new Exception("Unable to determine block reward: Unsupported chain type");
@@ -390,22 +348,12 @@ namespace Miningcore.Blockchain.Ethereum
             return result;
         }
 
-        internal static decimal GetUncleReward(ParityChainType chainType, ulong uheight, ulong height)
+        internal static decimal GetUncleReward(GethChainType chainType, ulong uheight, ulong height)
         {
             var reward = GetBaseBlockReward(chainType, height);
 
-            switch(chainType)
-            {
-                case ParityChainType.Classic:
-                    reward *= EthereumClassicConstants.UnclePercent;
-                    break;
-
-                default:
-                    // https://ethereum.stackexchange.com/a/27195/18000
-                    reward *= uheight + 8 - height;
-                    reward /= 8m;
-                    break;
-            }
+            reward *= uheight + 8 - height;
+            reward /= 8m;
 
             return reward;
         }
@@ -415,16 +363,12 @@ namespace Miningcore.Blockchain.Ethereum
             var commands = new[]
             {
                 new DaemonCmd(EC.GetNetVersion),
-                new DaemonCmd(EC.ParityChain),
             };
 
             var results = await daemon.ExecuteBatchAnyAsync(logger, commands);
 
             if(results.Any(x => x.Error != null))
             {
-                if(results[1].Error != null)
-                    isParity = false;
-
                 var errors = results.Take(1).Where(x => x.Error != null)
                     .ToArray();
 
@@ -434,37 +378,23 @@ namespace Miningcore.Blockchain.Ethereum
 
             // convert network
             var netVersion = results[0].Response.ToObject<string>();
-            var parityChain = isParity ?
-                results[1].Response.ToObject<string>() :
-                (extraPoolConfig?.ChainTypeOverride ?? "Mainnet");
+            var gethChain = extraPoolConfig?.ChainTypeOverride ?? "Ethereum";
 
-            EthereumUtils.DetectNetworkAndChain(netVersion, parityChain, out networkType, out chainType);
+            EthereumUtils.DetectNetworkAndChain(netVersion, gethChain, out networkType, out chainType);
         }
 
         private async Task<string> PayoutAsync(Balance balance)
         {
-            // unlock account
-            if(extraConfig.CoinbasePassword != null)
-            {
-                var unlockResponse = await daemon.ExecuteCmdSingleAsync<object>(logger, EC.UnlockAccount, new[]
-                {
-                    poolConfig.Address,
-                    extraConfig.CoinbasePassword,
-                    null
-                });
-
-                if(unlockResponse.Error != null || unlockResponse.Response == null || (bool) unlockResponse.Response == false)
-                    throw new Exception("Unable to unlock coinbase account for sending transaction");
-            }
-
             // send transaction
             logger.Info(() => $"[{LogCategory}] Sending {FormatAmount(balance.Amount)} to {balance.Address}");
+
+            var amount = (BigInteger) Math.Floor(balance.Amount * EthereumConstants.Wei);
 
             var request = new SendTransactionRequest
             {
                 From = poolConfig.Address,
                 To = balance.Address,
-                Value = (BigInteger) Math.Floor(balance.Amount * EthereumConstants.Wei),
+                Value = writeHex(amount),
             };
 
             var response = await daemon.ExecuteCmdSingleAsync<string>(logger, EC.SendTx, new[] { request });
@@ -483,6 +413,11 @@ namespace Miningcore.Blockchain.Ethereum
 
             // done
             return txHash;
+        }
+
+        private static string writeHex(BigInteger value)
+        {
+            return (value.ToString("x").TrimStart('0'));
         }
     }
 }

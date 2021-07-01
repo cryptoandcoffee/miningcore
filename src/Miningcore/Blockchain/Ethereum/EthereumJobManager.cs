@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -59,14 +39,17 @@ namespace Miningcore.Blockchain.Ethereum
             IComponentContext ctx,
             IMasterClock clock,
             IMessageBus messageBus,
+            IExtraNonceProvider extraNonceProvider,
             JsonSerializerSettings serializerSettings) :
             base(ctx, messageBus)
         {
             Contract.RequiresNonNull(ctx, nameof(ctx));
             Contract.RequiresNonNull(clock, nameof(clock));
             Contract.RequiresNonNull(messageBus, nameof(messageBus));
+            Contract.RequiresNonNull(extraNonceProvider, nameof(extraNonceProvider));
 
             this.clock = clock;
+            this.extraNonceProvider = extraNonceProvider;
 
             serializer = new JsonSerializer
             {
@@ -77,14 +60,13 @@ namespace Miningcore.Blockchain.Ethereum
         private DaemonEndpointConfig[] daemonEndpoints;
         private DaemonClient daemon;
         private EthereumNetworkType networkType;
-        private ParityChainType chainType;
-        private bool isParity = true;
+        private GethChainType chainType;
         private EthashFull ethash;
         private readonly IMasterClock clock;
-        private readonly EthereumExtraNonceProvider extraNonceProvider = new EthereumExtraNonceProvider();
+        private readonly IExtraNonceProvider extraNonceProvider;
 
         private const int MaxBlockBacklog = 3;
-        protected readonly Dictionary<string, EthereumJob> validJobs = new Dictionary<string, EthereumJob>();
+        protected readonly Dictionary<string, EthereumJob> validJobs = new();
         private EthereumPoolConfigExtra extraPoolConfig;
         private readonly JsonSerializer serializer;
 
@@ -114,8 +96,6 @@ namespace Miningcore.Blockchain.Ethereum
                 // may happen if daemon is currently not connected to peers
                 if(blockTemplate == null || blockTemplate.Header?.Length == 0)
                     return false;
-
-                // logger.Info(() => $"Blocktemplate {blockTemplate.Height}-{blockTemplate.Header}");
 
                 var job = currentJob;
                 var isNew = currentJob == null ||
@@ -165,40 +145,7 @@ namespace Miningcore.Blockchain.Ethereum
             return false;
         }
 
-        private Task<EthereumBlockTemplate> GetBlockTemplateAsync()
-        {
-            if(isParity)
-                return GetBlockTemplateParityAsync();
-
-            return GetBlockTemplateGethAsync();
-        }
-
-        private async Task<EthereumBlockTemplate> GetBlockTemplateParityAsync()
-        {
-            logger.LogInvoke();
-
-            var response = await daemon.ExecuteCmdAnyAsync<JToken>(logger, EC.GetWork);
-
-            if(response.Error != null)
-            {
-                logger.Warn(() => $"Error(s) refreshing blocktemplate: {response.Error})");
-                return null;
-            }
-
-            if(response.Response == null)
-            {
-                logger.Warn(() => $"Error(s) refreshing blocktemplate: {EC.GetWork} returned null response");
-                return null;
-            }
-
-            // extract results
-            var work = response.Response.ToObject<string[]>();
-            var result = AssembleBlockTemplate(work);
-
-            return result;
-        }
-
-        private async Task<EthereumBlockTemplate> GetBlockTemplateGethAsync()
+        private async Task<EthereumBlockTemplate> GetBlockTemplateAsync()
         {
             logger.LogInvoke();
 
@@ -220,23 +167,11 @@ namespace Miningcore.Blockchain.Ethereum
             var work = results[0].Response.ToObject<string[]>();
             var block = results[1].Response.ToObject<Block>();
 
-            // append blockheight (parity returns this as 4th element in the getWork response, geth does not)
+            // append blockheight (Recent versions of geth return this as the 4th element in the getWork response, older geth does not)
             if(work.Length < 4)
             {
                 var currentHeight = block.Height.Value;
                 work = work.Concat(new[] { (currentHeight + 1).ToStringHexWithPrefix() }).ToArray();
-            }
-
-            var result = AssembleBlockTemplate(work);
-            return result;
-        }
-
-        private EthereumBlockTemplate AssembleBlockTemplate(string[] work)
-        {
-            if(work.Length < 4)
-            {
-                logger.Error(() => $"Error(s) refreshing blocktemplate: getWork did not return blockheight. Are you really connected to a Parity daemon?");
-                return null;
             }
 
             // extract values
@@ -250,7 +185,7 @@ namespace Miningcore.Blockchain.Ethereum
                 Seed = work[1],
                 Target = targetString,
                 Difficulty = (ulong) BigInteger.Divide(EthereumConstants.BigMaxValue, target),
-                Height = height,
+                Height = height
             };
 
             return result;
@@ -308,6 +243,7 @@ namespace Miningcore.Blockchain.Ethereum
                 var commands = new[]
                 {
                     new DaemonCmd(EC.GetPeerCount),
+                    new DaemonCmd(EC.GetBlockByNumber, new[] { (object) "latest", true })
                 };
 
                 var results = await daemon.ExecuteBatchAnyAsync(logger, commands);
@@ -323,8 +259,21 @@ namespace Miningcore.Blockchain.Ethereum
 
                 // extract results
                 var peerCount = results[0].Response.ToObject<string>().IntegralFromHex<int>();
+                var latestBlockInfo = results[1].Response.ToObject<Block>();
 
-                BlockchainStats.NetworkHashrate = 0; // TODO
+                var latestBlockHeight = latestBlockInfo.Height.Value;
+                var latestBlockTimestamp = latestBlockInfo.Timestamp;
+                var latestBlockDifficulty = latestBlockInfo.Difficulty.IntegralFromHex<ulong>();
+
+                var sampleSize = (ulong) 300;
+                var sampleBlockNumber = latestBlockHeight - sampleSize;
+                var sampleBlockResults = await daemon.ExecuteCmdAllAsync<Block>(logger, EC.GetBlockByNumber, new[] { (object) sampleBlockNumber.ToStringHexWithPrefix(), true });
+                var sampleBlockTimestamp = sampleBlockResults.First(x => x.Error == null && x.Response?.Height != null).Response.Timestamp;
+
+                var blockTime = (double) (latestBlockTimestamp - sampleBlockTimestamp) / sampleSize;
+                var networkHashrate = (double) (latestBlockDifficulty / blockTime);
+
+                BlockchainStats.NetworkHashrate = blockTime > 0 ? networkHashrate : 0;
                 BlockchainStats.ConnectedPeers = peerCount;
             }
 
@@ -430,13 +379,13 @@ namespace Miningcore.Blockchain.Ethereum
             return true;
         }
 
-        public void PrepareWorker(StratumClient client)
+        public void PrepareWorker(StratumConnection client)
         {
             var context = client.ContextAs<EthereumWorkerContext>();
             context.ExtraNonce1 = extraNonceProvider.Next();
         }
 
-        public async ValueTask<Share> SubmitShareAsync(StratumClient worker, string[] request, CancellationToken ct)
+        public async ValueTask<Share> SubmitShareAsync(StratumConnection worker, string[] request, CancellationToken ct)
         {
             Contract.RequiresNonNull(worker, nameof(worker));
             Contract.RequiresNonNull(request, nameof(request));
@@ -481,7 +430,7 @@ namespace Miningcore.Blockchain.Ethereum
             return share;
         }
 
-        public BlockchainStats BlockchainStats { get; } = new BlockchainStats();
+        public BlockchainStats BlockchainStats { get; } = new();
 
         #endregion // API-Surface
 
@@ -502,7 +451,7 @@ namespace Miningcore.Blockchain.Ethereum
             if(responses.Where(x => x.Error?.InnerException?.GetType() == typeof(DaemonClientException))
                 .Select(x => (DaemonClientException) x.Error.InnerException)
                 .Any(x => x.Code == HttpStatusCode.Unauthorized))
-                logger.ThrowLogPoolStartupException($"Daemon reports invalid credentials");
+                logger.ThrowLogPoolStartupException("Daemon reports invalid credentials");
 
             return responses.All(x => x.Error == null);
         }
@@ -527,13 +476,13 @@ namespace Miningcore.Blockchain.Ethereum
 
                 if(isSynched)
                 {
-                    logger.Info(() => $"All daemons synched with blockchain");
+                    logger.Info(() => "All daemons synched with blockchain");
                     break;
                 }
 
                 if(!syncPendingNotificationShown)
                 {
-                    logger.Info(() => $"Daemons still syncing with network. Manager will be started once synced");
+                    logger.Info(() => "Daemons still syncing with network. Manager will be started once synced");
                     syncPendingNotificationShown = true;
                 }
 
@@ -551,16 +500,12 @@ namespace Miningcore.Blockchain.Ethereum
                 new DaemonCmd(EC.GetNetVersion),
                 new DaemonCmd(EC.GetAccounts),
                 new DaemonCmd(EC.GetCoinbase),
-                new DaemonCmd(EC.ParityChain),
             };
 
             var results = await daemon.ExecuteBatchAnyAsync(logger, commands);
 
             if(results.Any(x => x.Error != null))
             {
-                if(results[3].Error != null)
-                    isParity = false;
-
                 var errors = results.Take(3).Where(x => x.Error != null)
                     .ToArray();
 
@@ -572,18 +517,9 @@ namespace Miningcore.Blockchain.Ethereum
             var netVersion = results[0].Response.ToObject<string>();
             var accounts = results[1].Response.ToObject<string[]>();
             var coinbase = results[2].Response.ToObject<string>();
-            var parityChain = isParity ?
-                results[3].Response.ToObject<string>() :
-                (extraPoolConfig?.ChainTypeOverride ?? "Mainnet");
+            var gethChain = extraPoolConfig?.ChainTypeOverride ?? "Ethereum";
 
-            // ensure pool owns wallet
-            //if (clusterConfig.PaymentProcessing?.Enabled == true && !accounts.Contains(poolConfig.Address) || coinbase != poolConfig.Address)
-            //    logger.ThrowLogPoolStartupException($"Daemon does not own pool-address '{poolConfig.Address}'", LogCat);
-
-            EthereumUtils.DetectNetworkAndChain(netVersion, parityChain, out networkType, out chainType);
-
-            if(clusterConfig.PaymentProcessing?.Enabled == true && poolConfig.PaymentProcessing?.Enabled == true)
-                ConfigureRewards();
+            EthereumUtils.DetectNetworkAndChain(netVersion, gethChain, out networkType, out chainType);
 
             // update stats
             BlockchainStats.RewardType = "POW";
@@ -617,27 +553,27 @@ namespace Miningcore.Blockchain.Ethereum
 
                     if(blockTemplate != null)
                     {
-                        logger.Info(() => $"Loading current DAG ...");
+                        logger.Info(() => "Loading current DAG ...");
 
                         await ethash.GetDagAsync(blockTemplate.Height, logger, ct);
 
-                        logger.Info(() => $"Loaded current DAG");
+                        logger.Info(() => "Loaded current DAG");
                         break;
                     }
 
-                    logger.Info(() => $"Waiting for first valid block template");
+                    logger.Info(() => "Waiting for first valid block template");
                     await Task.Delay(TimeSpan.FromSeconds(5), ct);
                 }
             }
 
-            await SetupJobUpdatesAsync();
+            SetupJobUpdates();
         }
 
         private void ConfigureRewards()
         {
             // Donation to MiningCore development
-            if(networkType == EthereumNetworkType.Main &&
-                chainType == ParityChainType.Mainnet &&
+            if(networkType == EthereumNetworkType.Mainnet &&
+                chainType == GethChainType.Ethereum &&
                 DevDonation.Addresses.TryGetValue(poolConfig.Template.As<CoinTemplate>().Symbol, out var address))
             {
                 poolConfig.RewardRecipients = poolConfig.RewardRecipients.Concat(new[]
@@ -652,148 +588,22 @@ namespace Miningcore.Blockchain.Ethereum
             }
         }
 
-        protected virtual async Task SetupJobUpdatesAsync()
+        protected virtual void SetupJobUpdates()
         {
-            if(extraPoolConfig?.BtStream == null)
-            {
-                var enableStreaming = extraPoolConfig?.EnableDaemonWebsocketStreaming == true;
+            var pollingInterval = poolConfig.BlockRefreshInterval > 0 ? poolConfig.BlockRefreshInterval : 1000;
 
-                if(enableStreaming && !poolConfig.Daemons.Any(x =>
-                   x.Extra.SafeExtensionDataAs<EthereumDaemonEndpointConfigExtra>()?.PortWs.HasValue == true))
+            Jobs = Observable.Interval(TimeSpan.FromMilliseconds(pollingInterval))
+                .Select(_ => Observable.FromAsync(UpdateJobAsync))
+                .Concat()
+                .Do(isNew =>
                 {
-                    logger.Warn(() => $"'{nameof(EthereumPoolConfigExtra.EnableDaemonWebsocketStreaming).ToLowerCamelCase()}' enabled but not a single daemon found with a configured websocket port ('{nameof(EthereumDaemonEndpointConfigExtra.PortWs).ToLowerCamelCase()}'). Falling back to polling.");
-                    enableStreaming = false;
-                }
-
-                if(enableStreaming)
-                {
-                    // collect ports
-                    var wsDaemons = poolConfig.Daemons
-                        .Where(x => x.Extra.SafeExtensionDataAs<EthereumDaemonEndpointConfigExtra>()?.PortWs.HasValue == true)
-                        .ToDictionary(x => x, x =>
-                        {
-                            var extra = x.Extra.SafeExtensionDataAs<EthereumDaemonEndpointConfigExtra>();
-
-                            return (extra.PortWs.Value, extra.HttpPathWs, extra.SslWs);
-                        });
-
-                    logger.Info(() => $"Subscribing to WebSocket(s) {string.Join(", ", wsDaemons.Keys.Select(x => $"{(wsDaemons[x].SslWs ? "wss" : "ws")}://{x.Host}:{wsDaemons[x].Value}").Distinct())}");
-
-                    if(isParity)
-                    {
-                        // stream work updates
-                        var getWorkObs = daemon.WebsocketSubscribe(logger, wsDaemons, EC.ParitySubscribe, new[] { (object) EC.GetWork })
-                            .Select(data =>
-                            {
-                                try
-                                {
-                                    var psp = DeserializeRequest(data).ParamsAs<PubSubParams<string[]>>();
-                                    return psp?.Result;
-                                }
-
-                                catch(Exception ex)
-                                {
-                                    logger.Info(() => $"Error deserializing pending block: {ex.Message}");
-                                }
-
-                                return null;
-                            });
-
-                        Jobs = getWorkObs.Where(x => x != null)
-                            .Select(AssembleBlockTemplate)
-                            .Select(UpdateJob)
-                            .Do(isNew =>
-                            {
-                                if(isNew)
-                                    logger.Info(() => $"New work at height {currentJob.BlockTemplate.Height} and header {currentJob.BlockTemplate.Header} detected [{JobRefreshBy.WebSocket}]");
-                            })
-                            .Where(isNew => isNew)
-                            .Select(_ => GetJobParamsForStratum(true))
-                            .Publish()
-                            .RefCount();
-                    }
-
-                    else
-                    {
-                        var wsSubscription = "newHeads";
-                        var isRetry = false;
-                    retry:
-
-                        // stream work updates
-                        var getWorkObs = daemon.WebsocketSubscribe(logger, wsDaemons, EC.Subscribe, new[] { (object) wsSubscription, new object() });
-
-                        // test subscription
-                        var subcriptionResponse = await getWorkObs
-                            .Take(1)
-                            .Select(x => JsonConvert.DeserializeObject<JsonRpcResponse<string>>(Encoding.UTF8.GetString(x)))
-                            .ToTask();
-
-                        if(subcriptionResponse.Error != null)
-                        {
-                            // older versions of geth only support subscriptions to "newBlocks"
-                            if(!isRetry && subcriptionResponse.Error.Code == (int) BitcoinRPCErrorCode.RPC_METHOD_NOT_FOUND)
-                            {
-                                wsSubscription = "newBlocks";
-
-                                isRetry = true;
-                                goto retry;
-                            }
-
-                            logger.ThrowLogPoolStartupException($"Unable to subscribe to geth websocket '{wsSubscription}': {subcriptionResponse.Error.Message} [{subcriptionResponse.Error.Code}]");
-                        }
-
-                        Jobs = getWorkObs.Where(x => x != null)
-                            .Select(_ => Observable.FromAsync(UpdateJobAsync))
-                            .Concat()
-                            .Do(isNew =>
-                            {
-                                if(isNew)
-                                    logger.Info(() => $"New work at height {currentJob.BlockTemplate.Height} and header {currentJob.BlockTemplate.Header} detected [WS]");
-                            })
-                            .Where(isNew => isNew)
-                            .Select(_ => GetJobParamsForStratum(true))
-                            .Publish()
-                            .RefCount();
-                    }
-                }
-
-                else
-                {
-                    var pollingInterval = poolConfig.BlockRefreshInterval > 0 ? poolConfig.BlockRefreshInterval : 1000;
-
-                    Jobs = Observable.Interval(TimeSpan.FromMilliseconds(pollingInterval))
-                        .Select(_ => Observable.FromAsync(UpdateJobAsync))
-                        .Concat()
-                        .Do(isNew =>
-                        {
-                            if(isNew)
-                                logger.Info(() => $"New work at height {currentJob.BlockTemplate.Height} and header {currentJob.BlockTemplate.Header} detected [{JobRefreshBy.Poll}]");
-                        })
-                        .Where(isNew => isNew)
-                        .Select(_ => GetJobParamsForStratum(true))
-                        .Publish()
-                        .RefCount();
-                }
-            }
-
-            else
-            {
-                var btStream = BtStreamSubscribe(extraPoolConfig.BtStream);
-
-                Jobs = btStream.Where(x => x != null)
-                    .Select(JsonConvert.DeserializeObject<string[]>)
-                    .Select(AssembleBlockTemplate)
-                    .Select(UpdateJob)
-                    .Do(isNew =>
-                    {
-                        if(isNew)
-                            logger.Info(() => $"New work at height {currentJob.BlockTemplate.Height} and header {currentJob.BlockTemplate.Header} detected [{JobRefreshBy.BlockTemplateStream}]");
-                    })
-                    .Where(isNew => isNew)
-                    .Select(_ => GetJobParamsForStratum(true))
-                    .Publish()
-                    .RefCount();
-            }
+                    if(isNew)
+                        logger.Info(() => $"New work at height {currentJob.BlockTemplate.Height} and header {currentJob.BlockTemplate.Header} detected [{JobRefreshBy.Poll}]");
+                })
+                .Where(isNew => isNew)
+                .Select(_ => GetJobParamsForStratum(true))
+                .Publish()
+                .RefCount();
         }
 
         #endregion // Overrides

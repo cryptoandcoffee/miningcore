@@ -4,8 +4,8 @@ namespace Miningcore.Blockchain.Ethereum
 {
     public class EthereumUtils
     {
-        public static void DetectNetworkAndChain(string netVersionResponse, string parityChainResponse,
-            out EthereumNetworkType networkType, out ParityChainType chainType)
+        public static void DetectNetworkAndChain(string netVersionResponse, string gethChainResponse,
+            out EthereumNetworkType networkType, out GethChainType chainType)
         {
             // convert network
             if(int.TryParse(netVersionResponse, out var netWorkTypeInt))
@@ -20,16 +20,16 @@ namespace Miningcore.Blockchain.Ethereum
                 networkType = EthereumNetworkType.Unknown;
 
             // convert chain
-            if(!Enum.TryParse(parityChainResponse, true, out chainType))
+            if(!Enum.TryParse(gethChainResponse, true, out chainType))
             {
-                if(parityChainResponse.ToLower() == "ethereum classic")
-                    chainType = ParityChainType.Classic;
-                else
-                    chainType = ParityChainType.Unknown;
+               chainType = GethChainType.Unknown;
             }
 
-            if(chainType == ParityChainType.Foundation)
-                chainType = ParityChainType.Mainnet;
+            if(chainType == GethChainType.Ethereum)
+                chainType = GethChainType.Ethereum;
+
+            if(chainType == GethChainType.Callisto)
+                chainType = GethChainType.Callisto;
         }
     }
 }

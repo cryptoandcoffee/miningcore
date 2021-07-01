@@ -1,24 +1,5 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -50,7 +31,7 @@ namespace Miningcore.Blockchain.Equihash
         protected Network network;
 
         protected IDestination poolAddressDestination;
-        protected readonly HashSet<string> submissions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        protected readonly ConcurrentDictionary<string, bool> submissions = new(StringComparer.OrdinalIgnoreCase);
         protected uint256 blockTargetValue;
         protected byte[] coinbaseInitial;
 
@@ -101,7 +82,19 @@ namespace Miningcore.Blockchain.Equihash
             }
 
             // calculate outputs
-            if(networkParams.PayFoundersReward &&
+            if(networkParams.PayFundingStream)
+            {
+                rewardToPool = new Money(Math.Round(blockReward * (1m - (networkParams.PercentFoundersReward) / 100m)) + rewardFees, MoneyUnit.Satoshi);
+                tx.Outputs.Add(rewardToPool, poolAddressDestination);
+
+                foreach(FundingStream fundingstream in BlockTemplate.Subsidy.FundingStreams)
+                {
+                    var amount = new Money(Math.Round(fundingstream.ValueZat / 1m), MoneyUnit.Satoshi);
+                    var destination = FoundersAddressToScriptDestination(fundingstream.Address);
+                    tx.Outputs.Add(amount, destination);
+                }
+            }
+            else if(networkParams.PayFoundersReward &&
                 (networkParams.LastFoundersRewardBlockHeight >= BlockTemplate.Height ||
                     networkParams.TreasuryRewardStartBlockHeight > 0))
             {
@@ -140,6 +133,8 @@ namespace Miningcore.Blockchain.Equihash
                 tx.Outputs.Add(rewardToPool, poolAddressDestination);
             }
 
+            tx.Inputs.Add(TxIn.CreateCoinbase((int) BlockTemplate.Height));
+
             return tx;
         }
 
@@ -156,7 +151,6 @@ namespace Miningcore.Blockchain.Equihash
         {
             // output transaction
             txOut = CreateOutputTransaction();
-            txOut.Inputs.Add(TxIn.CreateCoinbase((int) BlockTemplate.Height));
 
             using(var stream = new MemoryStream())
             {
@@ -223,7 +217,7 @@ namespace Miningcore.Blockchain.Equihash
             }
         }
 
-        private (Share Share, string BlockHex) ProcessShareInternal(StratumClient worker, string nonce,
+        private (Share Share, string BlockHex) ProcessShareInternal(StratumConnection worker, string nonce,
             uint nTime, string solution)
         {
             var context = worker.ContextAs<BitcoinWorkerContext>();
@@ -233,13 +227,13 @@ namespace Miningcore.Blockchain.Equihash
             var headerBytes = SerializeHeader(nTime, nonce);
 
             // verify solution
-            if(!solver.Verify(headerBytes, solutionBytes.Slice(networkParams.SolutionPreambleSize)))
+            if(!solver.Verify(headerBytes, solutionBytes[networkParams.SolutionPreambleSize..]))
                 throw new StratumException(StratumError.Other, "invalid solution");
 
             // concat header and solution
             Span<byte> headerSolutionBytes = stackalloc byte[headerBytes.Length + solutionBytes.Length];
             headerBytes.CopyTo(headerSolutionBytes);
-            solutionBytes.CopyTo(headerSolutionBytes.Slice(headerBytes.Length));
+            solutionBytes.CopyTo(headerSolutionBytes[headerBytes.Length..]);
 
             // hash block-header
             Span<byte> headerHash = stackalloc byte[32];
@@ -299,15 +293,9 @@ namespace Miningcore.Blockchain.Equihash
 
         private bool RegisterSubmit(string nonce, string solution)
         {
-            lock(submissions)
-            {
-                var key = nonce.ToLower() + solution.ToLower();
-                if(submissions.Contains(key))
-                    return false;
+            var key = nonce + solution;
 
-                submissions.Add(key);
-                return true;
-            }
+            return submissions.TryAdd(key, true);
         }
 
         #region API-Surface
@@ -328,7 +316,7 @@ namespace Miningcore.Blockchain.Equihash
             this.clock = clock;
             this.poolAddressDestination = poolAddressDestination;
             coin = poolConfig.Template.As<EquihashCoinTemplate>();
-            networkParams = coin.GetNetwork(network.NetworkType);
+            networkParams = coin.GetNetwork(network.ChainName);
             this.network = network;
             BlockTemplate = blockTemplate;
             JobId = jobId;
@@ -381,7 +369,13 @@ namespace Miningcore.Blockchain.Equihash
             else
                 blockReward = BlockTemplate.CoinbaseValue;
 
-            if(networkParams?.PayFoundersReward == true)
+            if(networkParams?.PayFundingStream == true)
+            {
+                decimal fundingstreamTotal = 0;
+                fundingstreamTotal = blockTemplate.Subsidy.FundingStreams.Sum(x => x.Value);
+                blockReward = (blockTemplate.Subsidy.Miner + fundingstreamTotal) * BitcoinConstants.SatoshisPerBitcoin;
+            }
+            else if(networkParams?.PayFoundersReward == true)
             {
                 var founders = blockTemplate.Subsidy.Founders ?? blockTemplate.Subsidy.Community;
 
@@ -396,7 +390,7 @@ namespace Miningcore.Blockchain.Equihash
             BuildCoinbase();
 
             // build tx hashes
-            var txHashes = new List<uint256> { new uint256(coinbaseInitialHash) };
+            var txHashes = new List<uint256> { new(coinbaseInitialHash) };
             txHashes.AddRange(BlockTemplate.Transactions.Select(tx => new uint256(tx.Hash.HexToReverseByteArray())));
 
             // build merkle root
@@ -427,7 +421,7 @@ namespace Miningcore.Blockchain.Equihash
 
         public string JobId { get; protected set; }
 
-        public (Share Share, string BlockHex) ProcessShare(StratumClient worker, string extraNonce2, string nTime, string solution)
+        public (Share Share, string BlockHex) ProcessShare(StratumConnection worker, string extraNonce2, string nTime, string solution)
         {
             Contract.RequiresNonNull(worker, nameof(worker));
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(extraNonce2), $"{nameof(extraNonce2)} must not be empty");
@@ -463,7 +457,7 @@ namespace Miningcore.Blockchain.Equihash
 
         public object GetJobParams(bool isNew)
         {
-            jobParams[jobParams.Length - 1] = isNew;
+            jobParams[^1] = isNew;
             return jobParams;
         }
 

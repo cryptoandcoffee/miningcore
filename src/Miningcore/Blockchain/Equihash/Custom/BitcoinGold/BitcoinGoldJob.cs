@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -51,6 +31,8 @@ namespace Miningcore.Blockchain.Equihash.Custom.BitcoinGold
 
             // pool reward (t-addr)
             tx.Outputs.Add(rewardToPool, poolAddressDestination);
+
+            tx.Inputs.Add(TxIn.CreateCoinbase((int) BlockTemplate.Height));
 
             return tx;
         }
@@ -175,7 +157,7 @@ namespace Miningcore.Blockchain.Equihash.Custom.BitcoinGold
             coin = poolConfig.Template.As<EquihashCoinTemplate>();
             this.network = network;
             var equihashTemplate = poolConfig.Template.As<EquihashCoinTemplate>();
-            networkParams = coin.GetNetwork(network.NetworkType);
+            networkParams = coin.GetNetwork(network.ChainName);
             BlockTemplate = blockTemplate;
             JobId = jobId;
             Difficulty = (double) new BigRational(networkParams.Diff1BValue, BlockTemplate.Target.HexToReverseByteArray().AsSpan().ToBigInteger());
@@ -198,7 +180,7 @@ namespace Miningcore.Blockchain.Equihash.Custom.BitcoinGold
             BuildCoinbase();
 
             // build tx hashes
-            var txHashes = new List<uint256> { new uint256(coinbaseInitialHash) };
+            var txHashes = new List<uint256> { new(coinbaseInitialHash) };
             txHashes.AddRange(BlockTemplate.Transactions.Select(tx => new uint256(tx.TxId.HexToReverseByteArray())));
 
             // build merkle root

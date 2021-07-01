@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Linq;
 using System.Reactive;
@@ -27,12 +7,14 @@ using System.Threading;
 using System.Threading.Tasks;
 using Autofac;
 using AutoMapper;
+using Miningcore.Blockchain.Bitcoin;
 using Miningcore.Blockchain.Ethereum.Configuration;
 using Miningcore.Configuration;
 using Miningcore.Extensions;
 using Miningcore.JsonRpc;
 using Miningcore.Messaging;
 using Miningcore.Mining;
+using Miningcore.Nicehash;
 using Miningcore.Notifications.Messages;
 using Miningcore.Persistence;
 using Miningcore.Persistence.Repositories;
@@ -52,15 +34,16 @@ namespace Miningcore.Blockchain.Ethereum
             IStatsRepository statsRepo,
             IMapper mapper,
             IMasterClock clock,
-            IMessageBus messageBus) :
-            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus)
+            IMessageBus messageBus,
+            NicehashService nicehashService) :
+            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus, nicehashService)
         {
         }
 
         private object currentJobParams;
         private EthereumJobManager manager;
 
-        private async Task OnSubscribeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnSubscribeAsync(StratumConnection client, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
             var context = client.ContextAs<EthereumWorkerContext>();
@@ -94,7 +77,7 @@ namespace Miningcore.Blockchain.Ethereum
             context.UserAgent = requestParams[0].Trim();
         }
 
-        private async Task OnAuthorizeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnAuthorizeAsync(StratumConnection client, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
             var context = client.ContextAs<EthereumWorkerContext>();
@@ -103,18 +86,18 @@ namespace Miningcore.Blockchain.Ethereum
                 throw new StratumException(StratumError.MinusOne, "missing request id");
 
             var requestParams = request.ParamsAs<string[]>();
-            var workerValue = requestParams?.Length > 0 ? requestParams[0] : null;
+            var workerValue = requestParams?.Length > 0 ? requestParams[0] : "0";
             var password = requestParams?.Length > 1 ? requestParams[1] : null;
             var passParts = password?.Split(PasswordControlVarsSeparator);
 
             // extract worker/miner
             var workerParts = workerValue?.Split('.');
             var minerName = workerParts?.Length > 0 ? workerParts[0].Trim() : null;
-            var workerName = workerParts?.Length > 1 ? workerParts[1].Trim() : null;
+            var workerName = workerParts?.Length > 1 ? workerParts[1].Trim() : "0";
 
             // assumes that workerName is an address
             context.IsAuthorized = !string.IsNullOrEmpty(minerName) && manager.ValidateAddress(minerName);
-            context.Miner = minerName;
+            context.Miner = minerName.ToLower();
             context.Worker = workerName;
 
             // respond
@@ -138,7 +121,7 @@ namespace Miningcore.Blockchain.Ethereum
             logger.Info(() => $"[{client.ConnectionId}] Authorized worker {workerValue}");
         }
 
-        private async Task OnSubmitAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        private async Task OnSubmitAsync(StratumConnection client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
             var context = client.ContextAs<EthereumWorkerContext>();
@@ -213,7 +196,7 @@ namespace Miningcore.Blockchain.Ethereum
             }
         }
 
-        private async Task EnsureInitialWorkSent(StratumClient client)
+        private async Task EnsureInitialWorkSent(StratumConnection client)
         {
             var context = client.ContextAs<EthereumWorkerContext>();
             var sendInitialWork = false;
@@ -239,14 +222,14 @@ namespace Miningcore.Blockchain.Ethereum
         {
             currentJobParams = jobParams;
 
-            logger.Info(() => $"Broadcasting job");
+            logger.Info(() => "Broadcasting job");
 
-            var tasks = ForEachClient(async client =>
+            var tasks = ForEachConnection(async connection =>
             {
-                if(!client.IsAlive)
+                if(!connection.IsAlive)
                     return;
 
-                var context = client.ContextAs<EthereumWorkerContext>();
+                var context = connection.ContextAs<EthereumWorkerContext>();
 
                 if(context.IsSubscribed && context.IsAuthorized && context.IsInitialWorkSent)
                 {
@@ -256,17 +239,17 @@ namespace Miningcore.Blockchain.Ethereum
                     if(poolConfig.ClientConnectionTimeout > 0 &&
                         lastActivityAgo.TotalSeconds > poolConfig.ClientConnectionTimeout)
                     {
-                        logger.Info(() => $"[{client.ConnectionId}] Booting zombie-worker (idle-timeout exceeded)");
-                        DisconnectClient(client);
+                        logger.Info(() => $"[{connection.ConnectionId}] Booting zombie-worker (idle-timeout exceeded)");
+                        CloseConnection(connection);
                         return;
                     }
 
                     // varDiff: if the client has a pending difficulty change, apply it now
                     if(context.ApplyPendingDifficulty())
-                        await client.NotifyAsync(EthereumStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+                        await connection.NotifyAsync(EthereumStratumMethods.SetDifficulty, new object[] { context.Difficulty });
 
                     // send job
-                    await client.NotifyAsync(EthereumStratumMethods.MiningNotify, currentJobParams);
+                    await connection.NotifyAsync(EthereumStratumMethods.MiningNotify, currentJobParams);
                 }
             });
 
@@ -277,7 +260,9 @@ namespace Miningcore.Blockchain.Ethereum
 
         protected override async Task SetupJobManager(CancellationToken ct)
         {
-            manager = ctx.Resolve<EthereumJobManager>();
+            manager = ctx.Resolve<EthereumJobManager>(
+                new TypedParameter(typeof(IExtraNonceProvider), new EthereumExtraNonceProvider(clusterConfig.InstanceId)));
+
             manager.Configure(poolConfig, clusterConfig);
 
             await manager.StartAsync(ct);
@@ -326,7 +311,7 @@ namespace Miningcore.Blockchain.Ethereum
             return new EthereumWorkerContext();
         }
 
-        protected override async Task OnRequestAsync(StratumClient client,
+        protected override async Task OnRequestAsync(StratumConnection client,
             Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
@@ -371,7 +356,7 @@ namespace Miningcore.Blockchain.Ethereum
             return result;
         }
 
-        protected override async Task OnVarDiffUpdateAsync(StratumClient client, double newDiff)
+        protected override async Task OnVarDiffUpdateAsync(StratumConnection client, double newDiff)
         {
             await base.OnVarDiffUpdateAsync(client, newDiff);
 
@@ -386,16 +371,6 @@ namespace Miningcore.Blockchain.Ethereum
                 await client.NotifyAsync(EthereumStratumMethods.SetDifficulty, new object[] { context.Difficulty });
                 await client.NotifyAsync(EthereumStratumMethods.MiningNotify, currentJobParams);
             }
-        }
-
-        public override void Configure(PoolConfig poolConfig, ClusterConfig clusterConfig)
-        {
-            base.Configure(poolConfig, clusterConfig);
-
-            // validate mandatory extra config
-            var extraConfig = poolConfig.PaymentProcessing?.Extra?.SafeExtensionDataAs<EthereumPoolPaymentProcessingConfigExtra>();
-            if(clusterConfig.PaymentProcessing?.Enabled == true && extraConfig?.CoinbasePassword == null)
-                logger.ThrowLogPoolStartupException("\"paymentProcessing.coinbasePassword\" pool-configuration property missing or empty (required for unlocking wallet during payment processing)");
         }
 
         #endregion // Overrides

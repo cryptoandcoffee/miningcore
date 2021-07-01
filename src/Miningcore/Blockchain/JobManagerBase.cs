@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Reactive;
 using System.Reactive.Linq;
@@ -52,11 +32,11 @@ namespace Miningcore.Blockchain
 
         protected TJob currentJob;
         private int jobId;
-        protected object jobLock = new object();
+        protected object jobLock = new();
         protected ILogger logger;
         protected PoolConfig poolConfig;
         protected bool hasInitialBlockTemplate = false;
-        protected Subject<Unit> blockFoundSubject = new Subject<Unit>();
+        protected Subject<Unit> blockFoundSubject = new();
 
         protected abstract void ConfigureDaemons();
 
@@ -64,16 +44,16 @@ namespace Miningcore.Blockchain
         {
             while(!await AreDaemonsHealthyAsync())
             {
-                logger.Info(() => $"Waiting for daemons to come online ...");
+                logger.Info(() => "Waiting for daemons to come online ...");
 
                 await Task.Delay(TimeSpan.FromSeconds(10), ct);
             }
 
-            logger.Info(() => $"All daemons online");
+            logger.Info(() => "All daemons online");
 
             while(!await AreDaemonsConnectedAsync())
             {
-                logger.Info(() => $"Waiting for daemons to connect to peers ...");
+                logger.Info(() => "Waiting for daemons to connect to peers ...");
 
                 await Task.Delay(TimeSpan.FromSeconds(10), ct);
             }
@@ -82,7 +62,7 @@ namespace Miningcore.Blockchain
         protected string NextJobId(string format = null)
         {
             Interlocked.Increment(ref jobId);
-            var value = Interlocked.CompareExchange(ref jobId, 0, Int32.MinValue);
+            var value = Interlocked.CompareExchange(ref jobId, 0, int.MinValue);
 
             if(format != null)
                 return value.ToString(format);
@@ -96,9 +76,7 @@ namespace Miningcore.Blockchain
                 .Where(x => x.Topic == config.Topic)
                 .DoSafe(x => messageBus.SendMessage(new TelemetryEvent(
                     clusterConfig.ClusterName, poolConfig.Id, TelemetryCategory.BtStream, x.Received - x.Sent)), logger)
-                .Select(x => x.Payload)
-                .Publish()
-                .RefCount();
+                .Select(x => x.Payload);
         }
 
         protected virtual void OnBlockFound()
@@ -129,13 +107,13 @@ namespace Miningcore.Blockchain
         {
             Contract.RequiresNonNull(poolConfig, nameof(poolConfig));
 
-            logger.Info(() => $"Starting Job Manager ...");
+            logger.Info(() => "Starting Job Manager ...");
 
             await StartDaemonAsync(ct);
             await EnsureDaemonsSynchedAsync(ct);
             await PostStartInitAsync(ct);
 
-            logger.Info(() => $"Job Manager Online");
+            logger.Info(() => "Job Manager Online");
         }
 
         #endregion // API-Surface

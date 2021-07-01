@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
@@ -32,10 +12,10 @@ namespace Miningcore.Native
         private static extern bool convert_blob(byte* input, int inputSize, byte* output, ref int outputSize);
 
         [DllImport("libcryptonote", EntryPoint = "decode_address_export", CallingConvention = CallingConvention.Cdecl)]
-        private static extern UInt64 decode_address(byte* input, int inputSize);
+        private static extern ulong decode_address(byte* input, int inputSize);
 
         [DllImport("libcryptonote", EntryPoint = "decode_integrated_address_export", CallingConvention = CallingConvention.Cdecl)]
-        private static extern UInt64 decode_integrated_address(byte* input, int inputSize);
+        private static extern ulong decode_integrated_address(byte* input, int inputSize);
 
         [DllImport("libcryptonote", EntryPoint = "cn_fast_hash_export", CallingConvention = CallingConvention.Cdecl)]
         private static extern int cn_fast_hash(byte* input, byte* output, uint inputLength);
@@ -92,7 +72,7 @@ namespace Miningcore.Native
             }
         }
 
-        public static UInt64 DecodeAddress(string address)
+        public static ulong DecodeAddress(string address)
         {
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(address), $"{nameof(address)} must not be empty");
 
@@ -104,7 +84,7 @@ namespace Miningcore.Native
             }
         }
 
-        public static UInt64 DecodeIntegratedAddress(string address)
+        public static ulong DecodeIntegratedAddress(string address)
         {
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(address), $"{nameof(address)} must not be empty");
 

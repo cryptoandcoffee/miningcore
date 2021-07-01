@@ -1,28 +1,7 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System.IO;
 using FluentValidation;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
-using FluentValidation.Attributes;
 
 namespace Miningcore.Configuration
 {
@@ -226,6 +205,11 @@ namespace Miningcore.Configuration
                 .NotNull()
                 .NotEmpty();
 
+            RuleFor(j => j.InstanceId)
+                .GreaterThan((byte) 0)
+                .When(x => x.InstanceId.HasValue)
+                .WithMessage("instanceId must either be omitted or be non-zero");;
+
             // ensure pool ids are unique
             RuleFor(j => j.Pools)
                 .Must((pc, pools, ctx) =>
@@ -276,7 +260,6 @@ namespace Miningcore.Configuration
     {
     }
 
-    [Validator(typeof(VarDiffConfigValidator))]
     public partial class VarDiffConfig
     {
     }
@@ -297,42 +280,34 @@ namespace Miningcore.Configuration
     {
     }
 
-    [Validator(typeof(NetworkEndpointConfigValidator<NetworkEndpointConfig>))]
     public partial class NetworkEndpointConfig
     {
     }
 
-    [Validator(typeof(AuthenticatedNetworkEndpointConfigValidator<AuthenticatedNetworkEndpointConfig>))]
     public partial class AuthenticatedNetworkEndpointConfig
     {
     }
 
-    [Validator(typeof(EmailSenderConfigValidator))]
     public partial class EmailSenderConfig
     {
     }
 
-    [Validator(typeof(AdminNotificationsValidator))]
     public partial class AdminNotifications
     {
     }
 
-    [Validator(typeof(NotificationsConfigValidator))]
     public partial class NotificationsConfig
     {
     }
 
-    [Validator(typeof(ApiConfigValidator))]
     public partial class ApiConfig
     {
     }
 
-    [Validator(typeof(PoolConfigValidator))]
     public partial class PoolConfig
     {
     }
 
-    [Validator(typeof(ClusterConfigValidator))]
     public partial class ClusterConfig
     {
         public void Validate()

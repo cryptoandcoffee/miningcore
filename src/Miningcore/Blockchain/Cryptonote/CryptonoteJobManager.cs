@@ -1,30 +1,12 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Reactive;
 using System.Reactive.Linq;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Autofac;
@@ -40,12 +22,12 @@ using Miningcore.JsonRpc;
 using Miningcore.Messaging;
 using Miningcore.Native;
 using Miningcore.Notifications.Messages;
-using Miningcore.Payments;
 using Miningcore.Stratum;
 using Miningcore.Time;
 using Miningcore.Util;
 using MoreLinq;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using NLog;
 using Contract = Miningcore.Contracts.Contract;
 
@@ -64,23 +46,22 @@ namespace Miningcore.Blockchain.Cryptonote
             Contract.RequiresNonNull(messageBus, nameof(messageBus));
 
             this.clock = clock;
-
-            using(var rng = RandomNumberGenerator.Create())
-            {
-                instanceId = new byte[CryptonoteConstants.InstanceIdSize];
-                rng.GetNonZeroBytes(instanceId);
-            }
         }
 
-        private readonly byte[] instanceId;
+        private byte[] instanceId;
         private DaemonEndpointConfig[] daemonEndpoints;
         private DaemonClient daemon;
         private DaemonClient walletDaemon;
         private readonly IMasterClock clock;
         private CryptonoteNetworkType networkType;
         private CryptonotePoolConfigExtra extraPoolConfig;
-        private UInt64 poolAddressBase58Prefix;
+        private LibRandomX.randomx_flags? randomXFlagsOverride;
+        private LibRandomX.randomx_flags? randomXFlagsAdd;
+        private string currentSeedHash;
+        private string randomXRealm;
+        private ulong poolAddressBase58Prefix;
         private DaemonEndpointConfig[] walletDaemonEndpoints;
+        private CryptonoteCoinTemplate coin;
 
         protected async Task<bool> UpdateJob(string via = null, string json = null)
         {
@@ -112,7 +93,31 @@ namespace Miningcore.Blockchain.Cryptonote
                     else
                         logger.Info(() => $"Detected new block {blockTemplate.Height}");
 
-                    job = new CryptonoteJob(blockTemplate, instanceId, NextJobId(), poolConfig, clusterConfig, newHash);
+                    // detect seed hash change
+                    if(currentSeedHash != blockTemplate.SeedHash)
+                    {
+                        logger.Info(()=> $"Detected new seed hash {blockTemplate.SeedHash} starting @ height {blockTemplate.Height}");
+
+                        if(poolConfig.EnableInternalStratum == true)
+                        {
+                            LibRandomX.WithLock(() =>
+                            {
+                                // delete old seed
+                                if(currentSeedHash != null)
+                                    LibRandomX.DeleteSeed(randomXRealm, currentSeedHash);
+
+                                // activate new one
+                                currentSeedHash = blockTemplate.SeedHash;
+                                LibRandomX.CreateSeed(randomXRealm, currentSeedHash, randomXFlagsOverride, randomXFlagsAdd, extraPoolConfig.RandomXVMCount);
+                            });
+                        }
+
+                        else
+                            currentSeedHash = blockTemplate.SeedHash;
+                    }
+
+                    // init job
+                    job = new CryptonoteJob(blockTemplate, instanceId, NextJobId(), coin, poolConfig, clusterConfig, newHash, randomXRealm);
                     currentJob = job;
 
                     // update stats
@@ -121,6 +126,14 @@ namespace Miningcore.Blockchain.Cryptonote
                     BlockchainStats.NetworkDifficulty = job.BlockTemplate.Difficulty;
                     BlockchainStats.NextNetworkTarget = "";
                     BlockchainStats.NextNetworkBits = "";
+                }
+
+                else
+                {
+                    if(via != null)
+                        logger.Debug(() => $"Template update {blockTemplate.Height} [{via}]");
+                    else
+                        logger.Debug(() => $"Template update {blockTemplate.Height}");
                 }
 
                 return isNew;
@@ -210,7 +223,7 @@ namespace Miningcore.Blockchain.Cryptonote
             {
                 var error = response.Error?.Message ?? response.Response?.Status;
 
-                logger.Warn(() => $"Block {share.BlockHeight} [{blobHash.Substring(0, 6)}] submission failed with: {error}");
+                logger.Warn(() => $"Block {share.BlockHeight} [{blobHash[..6]}] submission failed with: {error}");
                 messageBus.SendMessage(new AdminNotification("Block submission failed", $"Pool {poolConfig.Id} {(!string.IsNullOrEmpty(share.Source) ? $"[{share.Source.ToUpper()}] " : string.Empty)}failed to submit block {share.BlockHeight}: {error}"));
                 return false;
             }
@@ -222,6 +235,8 @@ namespace Miningcore.Blockchain.Cryptonote
 
         public IObservable<Unit> Blocks { get; private set; }
 
+        public CryptonoteCoinTemplate Coin => coin;
+
         public override void Configure(PoolConfig poolConfig, ClusterConfig clusterConfig)
         {
             Contract.RequiresNonNull(poolConfig, nameof(poolConfig));
@@ -231,6 +246,14 @@ namespace Miningcore.Blockchain.Cryptonote
             this.poolConfig = poolConfig;
             this.clusterConfig = clusterConfig;
             extraPoolConfig = poolConfig.Extra.SafeExtensionDataAs<CryptonotePoolConfigExtra>();
+            coin = poolConfig.Template.As<CryptonoteCoinTemplate>();
+
+            if(poolConfig.EnableInternalStratum == true)
+            {
+                randomXRealm = !string.IsNullOrEmpty(extraPoolConfig.RandomXRealm) ? extraPoolConfig.RandomXRealm : poolConfig.Id;
+                randomXFlagsOverride = MakeRandomXFlags(extraPoolConfig.RandomXFlagsOverride);
+                randomXFlagsAdd = MakeRandomXFlags(extraPoolConfig.RandomXFlagsAdd);
+            }
 
             // extract standard daemon endpoints
             daemonEndpoints = poolConfig.Daemons
@@ -253,9 +276,6 @@ namespace Miningcore.Blockchain.Cryptonote
                     {
                         if(string.IsNullOrEmpty(x.HttpPath))
                             x.HttpPath = CryptonoteConstants.DaemonRpcLocation;
-
-                        // cryptonote daemons only support digest auth
-                        x.DigestAuth = true;
 
                         return x;
                     })
@@ -294,7 +314,7 @@ namespace Miningcore.Blockchain.Cryptonote
             return true;
         }
 
-        public BlockchainStats BlockchainStats { get; } = new BlockchainStats();
+        public BlockchainStats BlockchainStats { get; } = new();
 
         public void PrepareWorkerJob(CryptonoteWorkerJob workerJob, out string blob, out string target)
         {
@@ -312,7 +332,7 @@ namespace Miningcore.Blockchain.Cryptonote
             }
         }
 
-        public async ValueTask<Share> SubmitShareAsync(StratumClient worker,
+        public async ValueTask<Share> SubmitShareAsync(StratumConnection worker,
             CryptonoteSubmitShareRequest request, CryptonoteWorkerJob workerJob, double stratumDifficultyBase, CancellationToken ct)
         {
             Contract.RequiresNonNull(worker, nameof(worker));
@@ -341,13 +361,13 @@ namespace Miningcore.Blockchain.Cryptonote
             // if block candidate, submit & check if accepted by network
             if(share.IsBlockCandidate)
             {
-                logger.Info(() => $"Submitting block {share.BlockHeight} [{share.BlockHash.Substring(0, 6)}]");
+                logger.Info(() => $"Submitting block {share.BlockHeight} [{share.BlockHash[..6]}]");
 
                 share.IsBlockCandidate = await SubmitBlockAsync(share, blobHex, share.BlockHash);
 
                 if(share.IsBlockCandidate)
                 {
-                    logger.Info(() => $"Daemon accepted block {share.BlockHeight} [{share.BlockHash.Substring(0, 6)}] submitted by {context.Miner}");
+                    logger.Info(() => $"Daemon accepted block {share.BlockHeight} [{share.BlockHash[..6]}] submitted by {context.Miner}");
 
                     OnBlockFound();
 
@@ -365,6 +385,45 @@ namespace Miningcore.Blockchain.Cryptonote
         }
 
         #endregion // API-Surface
+
+        private static JToken GetFrameAsJToken(byte[] frame)
+        {
+            var text = Encoding.UTF8.GetString(frame);
+
+            // find end of message type indicator
+            var index = text.IndexOf(":");
+
+            if (index == -1)
+                return null;
+
+            var json = text.Substring(index + 1);
+
+            return JToken.Parse(json);
+        }
+
+        private LibRandomX.randomx_flags? MakeRandomXFlags(JToken token)
+        {
+            if(token == null)
+                return null;
+
+            if(token.Type == JTokenType.Integer)
+                return (LibRandomX.randomx_flags) token.Value<ulong>();
+            else if(token.Type == JTokenType.String)
+            {
+                LibRandomX.randomx_flags result = 0;
+                var value = token.Value<string>();
+
+                foreach(var flag in value.Split("|").Select(x=> x.Trim()).Where(x=> !string.IsNullOrEmpty(x)))
+                {
+                    if(Enum.TryParse(typeof(LibRandomX.randomx_flags), flag, true, out var flagVal))
+                        result |= (LibRandomX.randomx_flags) flagVal;
+                }
+
+                return result;
+            }
+
+            return null;
+        }
 
         #region Overrides
 
@@ -391,9 +450,9 @@ namespace Miningcore.Blockchain.Cryptonote
             if(responses.Where(x => x.Error?.InnerException?.GetType() == typeof(DaemonClientException))
                 .Select(x => (DaemonClientException) x.Error.InnerException)
                 .Any(x => x.Code == HttpStatusCode.Unauthorized))
-                logger.ThrowLogPoolStartupException($"Daemon reports invalid credentials");
+                logger.ThrowLogPoolStartupException("Daemon reports invalid credentials");
 
-            if(!responses.All(x => x.Error == null))
+            if(responses.Any(x => x.Error != null))
                 return false;
 
             if(clusterConfig.PaymentProcessing?.Enabled == true && poolConfig.PaymentProcessing?.Enabled == true)
@@ -404,7 +463,7 @@ namespace Miningcore.Blockchain.Cryptonote
                 if(responses2.Where(x => x.Error?.InnerException?.GetType() == typeof(DaemonClientException))
                     .Select(x => (DaemonClientException) x.Error.InnerException)
                     .Any(x => x.Code == HttpStatusCode.Unauthorized))
-                    logger.ThrowLogPoolStartupException($"Wallet-Daemon reports invalid credentials");
+                    logger.ThrowLogPoolStartupException("Wallet-Daemon reports invalid credentials");
 
                 return responses2.All(x => x.Error == null);
             }
@@ -439,13 +498,13 @@ namespace Miningcore.Blockchain.Cryptonote
 
                 if(isSynched)
                 {
-                    logger.Info(() => $"All daemons synched with blockchain");
+                    logger.Info(() => "All daemons synched with blockchain");
                     break;
                 }
 
                 if(!syncPendingNotificationShown)
                 {
-                    logger.Info(() => $"Daemons still syncing with network. Manager will be started once synced");
+                    logger.Info(() => "Daemons still syncing with network. Manager will be started once synced");
                     syncPendingNotificationShown = true;
                 }
 
@@ -458,6 +517,9 @@ namespace Miningcore.Blockchain.Cryptonote
 
         protected override async Task PostStartInitAsync(CancellationToken ct)
         {
+            SetInstanceId();
+
+            // coin config
             var coin = poolConfig.Template.As<CryptonoteCoinTemplate>();
             var infoResponse = await daemon.ExecuteCmdAnyAsync(logger, CryptonoteCommands.GetInfo);
 
@@ -476,7 +538,27 @@ namespace Miningcore.Blockchain.Cryptonote
             var info = infoResponse.Response.ToObject<GetInfoResponse>();
 
             // chain detection
-            networkType = info.IsTestnet ? CryptonoteNetworkType.Test : CryptonoteNetworkType.Main;
+            if(!string.IsNullOrEmpty(info.NetType))
+            {
+                switch(info.NetType.ToLower())
+                {
+                    case "mainnet":
+                        networkType = CryptonoteNetworkType.Main;
+                        break;
+                    case "stagenet":
+                        networkType = CryptonoteNetworkType.Stage;
+                        break;
+                    case "testnet":
+                        networkType = CryptonoteNetworkType.Test;
+                        break;
+                    default:
+                        logger.ThrowLogPoolStartupException($"Unsupport net type '{info.NetType}'");
+                        break;
+                }
+            }
+
+            else
+                networkType = info.IsTestnet ? CryptonoteNetworkType.Test : CryptonoteNetworkType.Main;
 
             // address validation
             poolAddressBase58Prefix = LibCryptonote.DecodeAddress(poolConfig.Address);
@@ -490,9 +572,14 @@ namespace Miningcore.Blockchain.Cryptonote
                         logger.ThrowLogPoolStartupException($"Invalid pool address prefix. Expected {coin.AddressPrefix}, got {poolAddressBase58Prefix}");
                     break;
 
+                case CryptonoteNetworkType.Stage:
+                    if(poolAddressBase58Prefix != coin.AddressPrefixStagenet)
+                        logger.ThrowLogPoolStartupException($"Invalid pool address prefix. Expected {coin.AddressPrefixStagenet}, got {poolAddressBase58Prefix}");
+                    break;
+
                 case CryptonoteNetworkType.Test:
                     if(poolAddressBase58Prefix != coin.AddressPrefixTestnet)
-                        logger.ThrowLogPoolStartupException($"Invalid pool address prefix. Expected {coin.AddressPrefix}, got {poolAddressBase58Prefix}");
+                        logger.ThrowLogPoolStartupException($"Invalid pool address prefix. Expected {coin.AddressPrefixTestnet}, got {poolAddressBase58Prefix}");
                     break;
             }
 
@@ -523,6 +610,19 @@ namespace Miningcore.Blockchain.Cryptonote
                 .Subscribe();
 
             SetupJobUpdates();
+        }
+
+        private void SetInstanceId()
+        {
+            instanceId = new byte[CryptonoteConstants.InstanceIdSize];
+
+            using(var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetNonZeroBytes(instanceId);
+            }
+
+            if(clusterConfig.InstanceId.HasValue)
+                instanceId[0] = clusterConfig.InstanceId.Value;
         }
 
         private void ConfigureRewards()
@@ -571,14 +671,38 @@ namespace Miningcore.Blockchain.Cryptonote
                     logger.Info(() => $"Subscribing to ZMQ push-updates from {string.Join(", ", zmq.Values)}");
 
                     var blockNotify = daemon.ZmqSubscribe(logger, zmq)
+                        .Where(msg =>
+                        {
+                            bool result = false;
+
+                            try
+                            {
+                                var text = Encoding.UTF8.GetString(msg[0].Read());
+
+                                result = text.StartsWith("json-minimal-chain_main:");
+                            }
+
+                            catch
+                            {
+                            }
+
+                            if(!result)
+                                msg.Dispose();
+
+                            return result;
+                        })
                         .Select(msg =>
                         {
                             using(msg)
                             {
+                                var token = GetFrameAsJToken(msg[0].Read());
+
+                                if (token != null)
+                                    return token.Value<long>("first_height").ToString(CultureInfo.InvariantCulture);
+
                                 // We just take the second frame's raw data and turn it into a hex string.
                                 // If that string changes, we got an update (DistinctUntilChanged)
-                                var result = msg[1].Read().ToHexString();
-                                return result;
+                                return msg[0].Read().ToHexString();
                             }
                         })
                         .DistinctUntilChanged()

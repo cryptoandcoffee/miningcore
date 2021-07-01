@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Globalization;
 using System.Linq;
@@ -35,6 +15,7 @@ using Miningcore.Extensions;
 using Miningcore.JsonRpc;
 using Miningcore.Messaging;
 using Miningcore.Mining;
+using Miningcore.Nicehash;
 using Miningcore.Notifications.Messages;
 using Miningcore.Persistence;
 using Miningcore.Persistence.Repositories;
@@ -54,8 +35,9 @@ namespace Miningcore.Blockchain.Equihash
             IStatsRepository statsRepo,
             IMapper mapper,
             IMasterClock clock,
-            IMessageBus messageBus) :
-            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus)
+            IMessageBus messageBus,
+            NicehashService nicehashService) :
+            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus, nicehashService)
         {
         }
 
@@ -72,7 +54,7 @@ namespace Miningcore.Blockchain.Equihash
 
             if(poolConfig.Template.As<EquihashCoinTemplate>().UsesZCashAddressFormat &&
                 string.IsNullOrEmpty(extraConfig?.ZAddress))
-                logger.ThrowLogPoolStartupException($"Pool z-address is not configured");
+                logger.ThrowLogPoolStartupException("Pool z-address is not configured");
         }
 
         /// <param name="ct"></param>
@@ -80,7 +62,7 @@ namespace Miningcore.Blockchain.Equihash
         protected override async Task SetupJobManager(CancellationToken ct)
         {
             manager = ctx.Resolve<EquihashJobManager>(
-                new TypedParameter(typeof(IExtraNonceProvider), new EquihashExtraNonceProvider()));
+                new TypedParameter(typeof(IExtraNonceProvider), new EquihashExtraNonceProvider(clusterConfig.InstanceId)));
 
             manager.Configure(poolConfig, clusterConfig);
 
@@ -127,10 +109,10 @@ namespace Miningcore.Blockchain.Equihash
             blockchainStats = manager.BlockchainStats;
         }
 
-        protected async Task OnSubscribeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        protected async Task OnSubscribeAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
@@ -139,26 +121,26 @@ namespace Miningcore.Blockchain.Equihash
 
             var data = new object[]
                 {
-                    client.ConnectionId,
+                    connection.ConnectionId,
                 }
-                .Concat(manager.GetSubscriberData(client))
+                .Concat(manager.GetSubscriberData(connection))
                 .ToArray();
 
-            await client.RespondAsync(data, request.Id);
+            await connection.RespondAsync(data, request.Id);
 
             // setup worker context
             context.IsSubscribed = true;
             context.UserAgent = requestParams?.Length > 0 ? requestParams[0].Trim() : null;
         }
 
-        protected async Task OnAuthorizeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        protected async Task OnAuthorizeAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
 
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
             var requestParams = request.ParamsAs<string[]>();
             var workerValue = requestParams?.Length > 0 ? requestParams[0] : null;
             var password = requestParams?.Length > 1 ? requestParams[1] : null;
@@ -177,10 +159,10 @@ namespace Miningcore.Blockchain.Equihash
             if(context.IsAuthorized)
             {
                 // respond
-                await client.RespondAsync(context.IsAuthorized, request.Id);
+                await connection.RespondAsync(context.IsAuthorized, request.Id);
 
                 // log association
-                logger.Info(() => $"[{client.ConnectionId}] Authorized worker {workerValue}");
+                logger.Info(() => $"[{connection.ConnectionId}] Authorized worker {workerValue}");
 
                 // extract control vars from password
                 var staticDiff = GetStaticDiffFromPassparts(passParts);
@@ -191,34 +173,34 @@ namespace Miningcore.Blockchain.Equihash
                     context.VarDiff = null; // disable vardiff
                     context.SetDifficulty(staticDiff.Value);
 
-                    logger.Info(() => $"[{client.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
+                    logger.Info(() => $"[{connection.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
 
-                    await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+                    await connection.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
                 }
 
                 // send intial update
-                await client.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
-                await client.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
+                await connection.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
+                await connection.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
             }
 
             else
             {
                 // respond
-                await client.RespondErrorAsync(StratumError.UnauthorizedWorker, "Authorization failed", request.Id, context.IsAuthorized);
+                await connection.RespondErrorAsync(StratumError.UnauthorizedWorker, "Authorization failed", request.Id, context.IsAuthorized);
 
                 // issue short-time ban if unauthorized to prevent DDos on daemon (validateaddress RPC)
-                logger.Info(() => $"[{client.ConnectionId}] Banning unauthorized worker for 60 sec");
+                logger.Info(() => $"[{connection.ConnectionId}] Banning unauthorized worker for 60 sec");
 
-                banManager.Ban(client.RemoteEndpoint.Address, TimeSpan.FromSeconds(60));
+                banManager.Ban(connection.RemoteEndpoint.Address, TimeSpan.FromSeconds(60));
 
-                DisconnectClient(client);
+                CloseConnection(connection);
             }
         }
 
-        protected virtual async Task OnSubmitAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        protected virtual async Task OnSubmitAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             try
             {
@@ -230,7 +212,7 @@ namespace Miningcore.Blockchain.Equihash
 
                 if(requestAge > maxShareAge)
                 {
-                    logger.Warn(() => $"[{client.ConnectionId}] Dropping stale share submission request (server overloaded?)");
+                    logger.Warn(() => $"[{connection.ConnectionId}] Dropping stale share submission request (server overloaded?)");
                     return;
                 }
 
@@ -245,19 +227,19 @@ namespace Miningcore.Blockchain.Equihash
 
                 // submit
                 var requestParams = request.ParamsAs<string[]>();
-                var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
+                var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
-                var share = await manager.SubmitShareAsync(client, requestParams, poolEndpoint.Difficulty, ct);
+                var share = await manager.SubmitShareAsync(connection, requestParams, poolEndpoint.Difficulty, ct);
 
-                await client.RespondAsync(true, request.Id);
+                await connection.RespondAsync(true, request.Id);
 
                 // publish
-                messageBus.SendMessage(new ClientShare(client, share));
+                messageBus.SendMessage(new ClientShare(connection, share));
 
                 // telemetry
                 PublishTelemetry(TelemetryCategory.Share, clock.Now - tsRequest.Timestamp.UtcDateTime, true);
 
-                logger.Info(() => $"[{client.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty, 3)}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty, 3)}");
 
                 // update pool stats
                 if(share.IsBlockCandidate)
@@ -265,7 +247,7 @@ namespace Miningcore.Blockchain.Equihash
 
                 // update client stats
                 context.Stats.ValidShares++;
-                await UpdateVarDiffAsync(client);
+                await UpdateVarDiffAsync(connection);
             }
 
             catch(StratumException ex)
@@ -275,19 +257,19 @@ namespace Miningcore.Blockchain.Equihash
 
                 // update client stats
                 context.Stats.InvalidShares++;
-                logger.Info(() => $"[{client.ConnectionId}] Share rejected: {ex.Message}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share rejected: {ex.Message}");
 
                 // banning
-                ConsiderBan(client, context, poolConfig.Banning);
+                ConsiderBan(connection, context, poolConfig.Banning);
 
                 throw;
             }
         }
 
-        private async Task OnSuggestTargetAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnSuggestTargetAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
@@ -300,29 +282,29 @@ namespace Miningcore.Blockchain.Equihash
                 if(System.Numerics.BigInteger.TryParse(target, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var targetBig))
                 {
                     var newDiff = (double) new BigRational(manager.ChainConfig.Diff1BValue, targetBig);
-                    var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
+                    var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
                     if(newDiff >= poolEndpoint.Difficulty)
                     {
                         context.EnqueueNewDifficulty(newDiff);
                         context.ApplyPendingDifficulty();
 
-                        await client.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
+                        await connection.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
                     }
 
                     else
-                        await client.RespondErrorAsync(StratumError.Other, "suggested difficulty too low", request.Id);
+                        await connection.RespondErrorAsync(StratumError.Other, "suggested difficulty too low", request.Id);
                 }
 
                 else
-                    await client.RespondErrorAsync(StratumError.Other, "invalid target", request.Id);
+                    await connection.RespondErrorAsync(StratumError.Other, "invalid target", request.Id);
             }
 
             else
-                await client.RespondErrorAsync(StratumError.Other, "invalid target", request.Id);
+                await connection.RespondErrorAsync(StratumError.Other, "invalid target", request.Id);
         }
 
-        protected override async Task OnRequestAsync(StratumClient client,
+        protected override async Task OnRequestAsync(StratumConnection connection,
             Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
@@ -332,19 +314,19 @@ namespace Miningcore.Blockchain.Equihash
                 switch(request.Method)
                 {
                     case BitcoinStratumMethods.Subscribe:
-                        await OnSubscribeAsync(client, tsRequest);
+                        await OnSubscribeAsync(connection, tsRequest);
                         break;
 
                     case BitcoinStratumMethods.Authorize:
-                        await OnAuthorizeAsync(client, tsRequest, ct);
+                        await OnAuthorizeAsync(connection, tsRequest, ct);
                         break;
 
                     case BitcoinStratumMethods.SubmitShare:
-                        await OnSubmitAsync(client, tsRequest, ct);
+                        await OnSubmitAsync(connection, tsRequest, ct);
                         break;
 
                     case EquihashStratumMethods.SuggestTarget:
-                        await OnSuggestTargetAsync(client, tsRequest);
+                        await OnSuggestTargetAsync(connection, tsRequest);
                         break;
 
                     case BitcoinStratumMethods.ExtraNonceSubscribe:
@@ -352,16 +334,16 @@ namespace Miningcore.Blockchain.Equihash
                         break;
 
                     default:
-                        logger.Debug(() => $"[{client.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
+                        logger.Debug(() => $"[{connection.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
 
-                        await client.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
+                        await connection.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
                         break;
                 }
             }
 
             catch(StratumException ex)
             {
-                await client.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
+                await connection.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
             }
         }
 
@@ -369,9 +351,9 @@ namespace Miningcore.Blockchain.Equihash
         {
             currentJobParams = jobParams;
 
-            logger.Info(() => $"Broadcasting job");
+            logger.Info(() => "Broadcasting job");
 
-            var tasks = ForEachClient(async client =>
+            var tasks = ForEachConnection(async client =>
             {
                 if(!client.IsAlive)
                     return;
@@ -387,7 +369,7 @@ namespace Miningcore.Blockchain.Equihash
                         lastActivityAgo.TotalSeconds > poolConfig.ClientConnectionTimeout)
                     {
                         logger.Info(() => $"[{client.ConnectionId}] Booting zombie-worker (idle-timeout exceeded)");
-                        DisconnectClient(client);
+                        CloseConnection(client);
                         return;
                     }
 
@@ -412,9 +394,9 @@ namespace Miningcore.Blockchain.Equihash
             return result;
         }
 
-        protected override async Task OnVarDiffUpdateAsync(StratumClient client, double newDiff)
+        protected override async Task OnVarDiffUpdateAsync(StratumConnection connection, double newDiff)
         {
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             context.EnqueueNewDifficulty(newDiff);
 
@@ -423,8 +405,8 @@ namespace Miningcore.Blockchain.Equihash
             {
                 context.ApplyPendingDifficulty();
 
-                await client.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
-                await client.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
+                await connection.NotifyAsync(EquihashStratumMethods.SetTarget, new object[] { EncodeTarget(context.Difficulty) });
+                await connection.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
             }
         }
 

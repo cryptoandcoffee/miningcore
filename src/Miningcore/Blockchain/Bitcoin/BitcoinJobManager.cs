@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Linq;
 using System.Reactive;
@@ -28,14 +8,18 @@ using Miningcore.Blockchain.Bitcoin.Configuration;
 using Miningcore.Blockchain.Bitcoin.DaemonResponses;
 using Miningcore.Configuration;
 using Miningcore.Contracts;
+using Miningcore.Crypto;
+using Miningcore.Crypto.Hashing.Algorithms;
 using Miningcore.DaemonInterface;
 using Miningcore.Extensions;
 using Miningcore.JsonRpc;
 using Miningcore.Messaging;
+using Miningcore.Native;
 using Miningcore.Notifications.Messages;
 using Miningcore.Stratum;
 using Miningcore.Time;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using NLog;
 
 namespace Miningcore.Blockchain.Bitcoin
@@ -53,12 +37,27 @@ namespace Miningcore.Blockchain.Bitcoin
 
         private BitcoinTemplate coin;
 
+        protected override object[] GetBlockTemplateParams()
+        {
+            var result = base.GetBlockTemplateParams();
+
+            if(coin.BlockTemplateRpcExtraParams != null)
+            {
+                if(coin.BlockTemplateRpcExtraParams.Type == JTokenType.Array)
+                    result = result.Concat(coin.BlockTemplateRpcExtraParams.ToObject<object[]>() ?? Array.Empty<object>()).ToArray();
+                else
+                    result = result.Concat(new []{ coin.BlockTemplateRpcExtraParams.ToObject<object>()}).ToArray();
+            }
+
+            return result;
+        }
+
         protected async Task<DaemonResponse<BlockTemplate>> GetBlockTemplateAsync()
         {
             logger.LogInvoke();
 
             var result = await daemon.ExecuteCmdAnyAsync<BlockTemplate>(logger,
-                BitcoinCommands.GetBlockTemplate, extraPoolConfig?.GBTArgs ?? (object) getBlockTemplateParams);
+                BitcoinCommands.GetBlockTemplate, extraPoolConfig?.GBTArgs ?? (object) GetBlockTemplateParams());
 
             return result;
         }
@@ -77,11 +76,18 @@ namespace Miningcore.Blockchain.Bitcoin
 
         private BitcoinJob CreateJob()
         {
-            //switch (coin.Subfamily)
-            //{
-            //}
+            return new();
+        }
 
-            return new BitcoinJob();
+        protected override void PostChainIdentifyConfigure()
+        {
+            base.PostChainIdentifyConfigure();
+
+            if(poolConfig.EnableInternalStratum == true && coin.HeaderHasherValue is IHashAlgorithmInit hashInit)
+            {
+                if(!hashInit.DigestInit(poolConfig))
+                    logger.Error(()=> $"{hashInit.GetType().Name} initialization failed");
+            }
         }
 
         protected override async Task<(bool IsNew, bool Force)> UpdateJob(bool forceUpdate, string via = null, string json = null)
@@ -148,6 +154,14 @@ namespace Miningcore.Blockchain.Bitcoin
                         BlockchainStats.NextNetworkBits = blockTemplate.Bits;
                     }
 
+                    else
+                    {
+                        if(via != null)
+                            logger.Debug(() => $"Template update {blockTemplate.Height} [{via}]");
+                        else
+                            logger.Debug(() => $"Template update {blockTemplate.Height}");
+                    }
+
                     currentJob = job;
                 }
 
@@ -184,7 +198,7 @@ namespace Miningcore.Blockchain.Bitcoin
             base.Configure(poolConfig, clusterConfig);
         }
 
-        public override object[] GetSubscriberData(StratumClient worker)
+        public override object[] GetSubscriberData(StratumConnection worker)
         {
             Contract.RequiresNonNull(worker, nameof(worker));
 
@@ -203,7 +217,7 @@ namespace Miningcore.Blockchain.Bitcoin
             return responseData;
         }
 
-        public override async ValueTask<Share> SubmitShareAsync(StratumClient worker, object submission,
+        public override async ValueTask<Share> SubmitShareAsync(StratumConnection worker, object submission,
             double stratumDifficultyBase, CancellationToken ct)
         {
             Contract.RequiresNonNull(worker, nameof(worker));

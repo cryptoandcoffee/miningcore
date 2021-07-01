@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -73,17 +53,13 @@ namespace Miningcore.DaemonInterface
         private readonly JsonSerializerSettings serializerSettings;
 
         protected DaemonEndpointConfig[] endPoints;
-        private Dictionary<DaemonEndpointConfig, HttpClient> httpClients;
         private readonly JsonSerializer serializer;
 
-        private static readonly HttpClient defaultHttpClient = new HttpClient(new SocketsHttpHandler
+        private static readonly HttpClient httpClient = new(new HttpClientHandler
         {
             AutomaticDecompression = DecompressionMethods.Deflate | DecompressionMethods.GZip,
 
-            SslOptions = new SslClientAuthenticationOptions
-            {
-                RemoteCertificateValidationCallback = ((sender, certificate, chain, errors) => true),
-            }
+            ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true,
         });
 
         // Telemetry
@@ -99,32 +75,12 @@ namespace Miningcore.DaemonInterface
 
         #region API-Surface
 
-        public void Configure(DaemonEndpointConfig[] endPoints, string digestAuthRealm = null)
+        public void Configure(DaemonEndpointConfig[] endPoints)
         {
             Contract.RequiresNonNull(endPoints, nameof(endPoints));
             Contract.Requires<ArgumentException>(endPoints.Length > 0, $"{nameof(endPoints)} must not be empty");
 
             this.endPoints = endPoints;
-
-            // create one HttpClient instance per endpoint that carries the associated credentials
-            httpClients = endPoints.ToDictionary(endpoint => endpoint, endpoint =>
-            {
-                if(string.IsNullOrEmpty(endpoint.User) || !endpoint.DigestAuth)
-                    return defaultHttpClient;
-
-                return new HttpClient(new SocketsHttpHandler
-                {
-                    AutomaticDecompression = DecompressionMethods.Deflate | DecompressionMethods.GZip,
-
-                    Credentials = new NetworkCredential(endpoint.User, endpoint.Password),
-                    PreAuthenticate = true,
-
-                    SslOptions = new SslClientAuthenticationOptions
-                    {
-                        RemoteCertificateValidationCallback = ((sender, certificate, chain, errors) => true),
-                    }
-                });
-            });
         }
 
         /// <summary>
@@ -347,7 +303,7 @@ namespace Miningcore.DaemonInterface
                 request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
                 // build auth header
-                if(!string.IsNullOrEmpty(endPoint.User) && !endPoint.DigestAuth)
+                if(!string.IsNullOrEmpty(endPoint.User))
                 {
                     var auth = $"{endPoint.User}:{endPoint.Password}";
                     var base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(auth));
@@ -357,10 +313,10 @@ namespace Miningcore.DaemonInterface
                 logger.Trace(() => $"Sending RPC request to {requestUrl}: {json}");
 
                 // send request
-                using(var response = await httpClients[endPoint].SendAsync(request, ct))
+                using(var response = await httpClient.SendAsync(request, ct))
                 {
                     // read response
-                    var responseContent = await response.Content.ReadAsStringAsync();
+                    var responseContent = await response.Content.ReadAsStringAsync(ct);
 
                     // deserialize response
                     using(var jreader = new JsonTextReader(new StringReader(responseContent)))
@@ -405,7 +361,7 @@ namespace Miningcore.DaemonInterface
                 request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
                 // build auth header
-                if(!string.IsNullOrEmpty(endPoint.User) && !endPoint.DigestAuth)
+                if(!string.IsNullOrEmpty(endPoint.User))
                 {
                     var auth = $"{endPoint.User}:{endPoint.Password}";
                     var base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(auth));
@@ -415,7 +371,7 @@ namespace Miningcore.DaemonInterface
                 logger.Trace(() => $"Sending RPC request to {requestUrl}: {json}");
 
                 // send request
-                using(var response = await httpClients[endPoint].SendAsync(request))
+                using(var response = await httpClient.SendAsync(request))
                 {
                     // deserialize response
                     var jsonResponse = await response.Content.ReadAsStringAsync();
@@ -584,7 +540,7 @@ namespace Miningcore.DaemonInterface
                                 await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
                         }
                     }
-                });
+                }, cts.Token);
 
                 return Disposable.Create(() => { cts.Cancel(); });
             }));

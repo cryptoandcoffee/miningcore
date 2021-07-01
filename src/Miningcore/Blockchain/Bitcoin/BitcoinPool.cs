@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -34,6 +14,8 @@ using Miningcore.Extensions;
 using Miningcore.JsonRpc;
 using Miningcore.Messaging;
 using Miningcore.Mining;
+using Miningcore.Nicehash;
+using Miningcore.Nicehash.API;
 using Miningcore.Notifications.Messages;
 using Miningcore.Persistence;
 using Miningcore.Persistence.Repositories;
@@ -54,8 +36,9 @@ namespace Miningcore.Blockchain.Bitcoin
             IStatsRepository statsRepo,
             IMapper mapper,
             IMasterClock clock,
-            IMessageBus messageBus) :
-            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus)
+            IMessageBus messageBus,
+            NicehashService nicehashService) :
+            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus, nicehashService)
         {
         }
 
@@ -63,46 +46,46 @@ namespace Miningcore.Blockchain.Bitcoin
         protected BitcoinJobManager manager;
         private BitcoinTemplate coin;
 
-        protected virtual async Task OnSubscribeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        protected virtual async Task OnSubscribeAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
 
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
             var requestParams = request.ParamsAs<string[]>();
 
             var data = new object[]
                 {
                     new object[]
                     {
-                        new object[] { BitcoinStratumMethods.SetDifficulty, client.ConnectionId },
-                        new object[] { BitcoinStratumMethods.MiningNotify, client.ConnectionId }
+                        new object[] { BitcoinStratumMethods.SetDifficulty, connection.ConnectionId },
+                        new object[] { BitcoinStratumMethods.MiningNotify, connection.ConnectionId }
                     }
                 }
-                .Concat(manager.GetSubscriberData(client))
+                .Concat(manager.GetSubscriberData(connection))
                 .ToArray();
 
-            await client.RespondAsync(data, request.Id);
+            await connection.RespondAsync(data, request.Id);
 
             // setup worker context
             context.IsSubscribed = true;
             context.UserAgent = requestParams?.Length > 0 ? requestParams[0].Trim() : null;
 
             // send intial update
-            await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
-            await client.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
+            await connection.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+            await connection.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
         }
 
-        protected virtual async Task OnAuthorizeAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        protected virtual async Task OnAuthorizeAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
 
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
             var requestParams = request.ParamsAs<string[]>();
             var workerValue = requestParams?.Length > 0 ? requestParams[0] : null;
             var password = requestParams?.Length > 1 ? requestParams[1] : null;
@@ -113,7 +96,7 @@ namespace Miningcore.Blockchain.Bitcoin
             var minerName = split?.FirstOrDefault()?.Trim();
             var workerName = split?.Skip(1).FirstOrDefault()?.Trim() ?? string.Empty;
 
-            // assumes that workerName is an address
+            // assumes that minerName is an address
             context.IsAuthorized = !string.IsNullOrEmpty(minerName) && await manager.ValidateAddressAsync(minerName, ct);
             context.Miner = minerName;
             context.Worker = workerName;
@@ -121,44 +104,67 @@ namespace Miningcore.Blockchain.Bitcoin
             if(context.IsAuthorized)
             {
                 // respond
-                await client.RespondAsync(context.IsAuthorized, request.Id);
+                await connection.RespondAsync(context.IsAuthorized, request.Id);
 
                 // log association
-                logger.Info(() => $"[{client.ConnectionId}] Authorized worker {workerValue}");
+                logger.Info(() => $"[{connection.ConnectionId}] Authorized worker {workerValue}");
 
                 // extract control vars from password
                 var staticDiff = GetStaticDiffFromPassparts(passParts);
+
+                // Nicehash support
+                if(clusterConfig.Nicehash?.EnableAutoDiff == true &&
+                   context.UserAgent.Contains(NicehashConstants.NicehashUA, StringComparison.OrdinalIgnoreCase))
+                {
+                    // query current diff
+                    var nicehashDiff = await nicehashService.GetStaticDiff(coin.Name, coin.GetAlgorithmName(), CancellationToken.None);
+
+                    if(nicehashDiff.HasValue)
+                    {
+                        if(!staticDiff.HasValue || nicehashDiff > staticDiff)
+                        {
+                            logger.Info(() => $"[{connection.ConnectionId}] Nicehash detected. Using API supplied difficulty of {nicehashDiff.Value}");
+
+                            staticDiff = nicehashDiff;
+                        }
+
+                        else
+                            logger.Info(() => $"[{connection.ConnectionId}] Nicehash detected. Using custom difficulty of {staticDiff.Value}");
+                    }
+                }
+
+                // Static diff
                 if(staticDiff.HasValue &&
-                    (context.VarDiff != null && staticDiff.Value >= context.VarDiff.Config.MinDiff ||
-                        context.VarDiff == null && staticDiff.Value > context.Difficulty))
+                   (context.VarDiff != null && staticDiff.Value >= context.VarDiff.Config.MinDiff ||
+                    context.VarDiff == null && staticDiff.Value > context.Difficulty))
                 {
                     context.VarDiff = null; // disable vardiff
                     context.SetDifficulty(staticDiff.Value);
 
-                    logger.Info(() => $"[{client.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
+                    logger.Info(() => $"[{connection.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
 
-                    await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+                    await connection.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
                 }
             }
 
             else
             {
                 // respond
-                await client.RespondErrorAsync(StratumError.UnauthorizedWorker, "Authorization failed", request.Id, context.IsAuthorized);
+                await connection.RespondErrorAsync(StratumError.UnauthorizedWorker, "Authorization failed", request.Id, context.IsAuthorized);
 
                 // issue short-time ban if unauthorized to prevent DDos on daemon (validateaddress RPC)
-                logger.Info(() => $"[{client.ConnectionId}] Banning unauthorized worker for 60 sec");
+                logger.Info(() => $"[{connection.ConnectionId}] Banning unauthorized worker for 60 sec");
 
-                banManager.Ban(client.RemoteEndpoint.Address, TimeSpan.FromSeconds(60));
+                banManager.Ban(connection.RemoteEndpoint.Address, TimeSpan.FromSeconds(60));
 
-                DisconnectClient(client);
+                CloseConnection(connection);
             }
         }
 
-        protected virtual async Task OnSubmitAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        protected virtual async Task OnSubmitAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             try
             {
@@ -170,7 +176,7 @@ namespace Miningcore.Blockchain.Bitcoin
 
                 if(requestAge > maxShareAge)
                 {
-                    logger.Warn(() => $"[{client.ConnectionId}] Dropping stale share submission request (server overloaded?)");
+                    logger.Warn(() => $"[{connection.ConnectionId}] Dropping stale share submission request (server overloaded?)");
                     return;
                 }
 
@@ -185,19 +191,19 @@ namespace Miningcore.Blockchain.Bitcoin
 
                 // submit
                 var requestParams = request.ParamsAs<string[]>();
-                var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
+                var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
-                var share = await manager.SubmitShareAsync(client, requestParams, poolEndpoint.Difficulty, ct);
+                var share = await manager.SubmitShareAsync(connection, requestParams, poolEndpoint.Difficulty, ct);
 
-                await client.RespondAsync(true, request.Id);
+                await connection.RespondAsync(true, request.Id);
 
                 // publish
-                messageBus.SendMessage(new ClientShare(client, share));
+                messageBus.SendMessage(new ClientShare(connection, share));
 
                 // telemetry
                 PublishTelemetry(TelemetryCategory.Share, clock.Now - tsRequest.Timestamp.UtcDateTime, true);
 
-                logger.Info(() => $"[{client.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty * coin.ShareMultiplier, 3)}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty * coin.ShareMultiplier, 3)}");
 
                 // update pool stats
                 if(share.IsBlockCandidate)
@@ -205,7 +211,7 @@ namespace Miningcore.Blockchain.Bitcoin
 
                 // update client stats
                 context.Stats.ValidShares++;
-                await UpdateVarDiffAsync(client);
+                await UpdateVarDiffAsync(connection);
             }
 
             catch(StratumException ex)
@@ -215,36 +221,36 @@ namespace Miningcore.Blockchain.Bitcoin
 
                 // update client stats
                 context.Stats.InvalidShares++;
-                logger.Info(() => $"[{client.ConnectionId}] Share rejected: {ex.Message}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share rejected: {ex.Message}");
 
                 // banning
-                ConsiderBan(client, context, poolConfig.Banning);
+                ConsiderBan(connection, context, poolConfig.Banning);
 
                 throw;
             }
         }
 
-        private async Task OnSuggestDifficultyAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnSuggestDifficultyAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             // acknowledge
-            await client.RespondAsync(true, request.Id);
+            await connection.RespondAsync(true, request.Id);
 
             try
             {
                 var requestedDiff = (double) Convert.ChangeType(request.Params, TypeCode.Double);
 
                 // client may suggest higher-than-base difficulty, but not a lower one
-                var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
+                var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
                 if(requestedDiff > poolEndpoint.Difficulty)
                 {
                     context.SetDifficulty(requestedDiff);
-                    await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+                    await connection.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
 
-                    logger.Info(() => $"[{client.ConnectionId}] Difficulty set to {requestedDiff} as requested by miner");
+                    logger.Info(() => $"[{connection.ConnectionId}] Difficulty set to {requestedDiff} as requested by miner");
                 }
             }
 
@@ -254,10 +260,10 @@ namespace Miningcore.Blockchain.Bitcoin
             }
         }
 
-        private async Task OnConfigureMiningAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnConfigureMiningAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
 
             var requestParams = request.ParamsAs<JToken[]>();
             var extensions = requestParams[0].ToObject<string[]>();
@@ -269,23 +275,23 @@ namespace Miningcore.Blockchain.Bitcoin
                 switch(extension)
                 {
                     case BitcoinStratumExtensions.VersionRolling:
-                        ConfigureVersionRolling(client, context, extensionParams, result);
+                        ConfigureVersionRolling(connection, context, extensionParams, result);
                         break;
 
                     case BitcoinStratumExtensions.MinimumDiff:
-                        ConfigureMinimumDiff(client, context, extensionParams, result);
+                        ConfigureMinimumDiff(connection, context, extensionParams, result);
                         break;
                 }
             }
 
-            await client.RespondAsync(result, request.Id);
+            await connection.RespondAsync(result, request.Id);
         }
 
-        private void ConfigureVersionRolling(StratumClient client, BitcoinWorkerContext context,
-            Dictionary<string, JToken> extensionParams, Dictionary<string, object> result)
+        private void ConfigureVersionRolling(StratumConnection connection, BitcoinWorkerContext context,
+            IReadOnlyDictionary<string, JToken> extensionParams, Dictionary<string, object> result)
         {
             //var requestedBits = extensionParams[BitcoinStratumExtensions.VersionRollingBits].Value<int>();
-            uint requestedMask = BitcoinConstants.VersionRollingPoolMask;
+            var requestedMask = BitcoinConstants.VersionRollingPoolMask;
 
             if(extensionParams.TryGetValue(BitcoinStratumExtensions.VersionRollingMask, out var requestedMaskValue))
                 requestedMask = uint.Parse(requestedMaskValue.Value<string>(), NumberStyles.HexNumber);
@@ -297,23 +303,23 @@ namespace Miningcore.Blockchain.Bitcoin
             result[BitcoinStratumExtensions.VersionRolling] = true;
             result[BitcoinStratumExtensions.VersionRollingMask] = context.VersionRollingMask.Value.ToStringHex8();
 
-            logger.Info(() => $"[{client.ConnectionId}] Using version-rolling mask {result[BitcoinStratumExtensions.VersionRollingMask]}");
+            logger.Info(() => $"[{connection.ConnectionId}] Using version-rolling mask {result[BitcoinStratumExtensions.VersionRollingMask]}");
         }
 
-        private void ConfigureMinimumDiff(StratumClient client, BitcoinWorkerContext context,
-            Dictionary<string, JToken> extensionParams, Dictionary<string, object> result)
+        private void ConfigureMinimumDiff(StratumConnection connection, BitcoinWorkerContext context,
+            IReadOnlyDictionary<string, JToken> extensionParams, Dictionary<string, object> result)
         {
             var requestedDiff = extensionParams[BitcoinStratumExtensions.MinimumDiffValue].Value<double>();
 
             // client may suggest higher-than-base difficulty, but not a lower one
-            var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
+            var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
             if(requestedDiff > poolEndpoint.Difficulty)
             {
                 context.VarDiff = null; // disable vardiff
                 context.SetDifficulty(requestedDiff);
 
-                logger.Info(() => $"[{client.ConnectionId}] Difficulty set to {requestedDiff} as requested by miner. VarDiff now disabled.");
+                logger.Info(() => $"[{connection.ConnectionId}] Difficulty set to {requestedDiff} as requested by miner. VarDiff now disabled.");
 
                 // enabled
                 result[BitcoinStratumExtensions.MinimumDiff] = true;
@@ -324,9 +330,9 @@ namespace Miningcore.Blockchain.Bitcoin
         {
             currentJobParams = jobParams;
 
-            logger.Info(() => $"Broadcasting job");
+            logger.Info(() => "Broadcasting job");
 
-            var tasks = ForEachClient(async client =>
+            var tasks = ForEachConnection(async client =>
             {
                 if(!client.IsAlive)
                     return;
@@ -342,7 +348,7 @@ namespace Miningcore.Blockchain.Bitcoin
                         lastActivityAgo.TotalSeconds > poolConfig.ClientConnectionTimeout)
                     {
                         logger.Info(() => $"[{client.ConnectionId}] Booting zombie-worker (idle-timeout exceeded)");
-                        DisconnectClient(client);
+                        CloseConnection(client);
                         return;
                     }
 
@@ -388,7 +394,7 @@ namespace Miningcore.Blockchain.Bitcoin
         protected override async Task SetupJobManager(CancellationToken ct)
         {
             manager = ctx.Resolve<BitcoinJobManager>(
-                new TypedParameter(typeof(IExtraNonceProvider), new BitcoinExtraNonceProvider()));
+                new TypedParameter(typeof(IExtraNonceProvider), new BitcoinExtraNonceProvider(clusterConfig.InstanceId)));
 
             manager.Configure(poolConfig, clusterConfig);
 
@@ -438,7 +444,7 @@ namespace Miningcore.Blockchain.Bitcoin
             return new BitcoinWorkerContext();
         }
 
-        protected override async Task OnRequestAsync(StratumClient client,
+        protected override async Task OnRequestAsync(StratumConnection connection,
             Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
@@ -448,28 +454,28 @@ namespace Miningcore.Blockchain.Bitcoin
                 switch(request.Method)
                 {
                     case BitcoinStratumMethods.Subscribe:
-                        await OnSubscribeAsync(client, tsRequest);
+                        await OnSubscribeAsync(connection, tsRequest);
                         break;
 
                     case BitcoinStratumMethods.Authorize:
-                        await OnAuthorizeAsync(client, tsRequest, ct);
+                        await OnAuthorizeAsync(connection, tsRequest, ct);
                         break;
 
                     case BitcoinStratumMethods.SubmitShare:
-                        await OnSubmitAsync(client, tsRequest, ct);
+                        await OnSubmitAsync(connection, tsRequest, ct);
                         break;
 
                     case BitcoinStratumMethods.SuggestDifficulty:
-                        await OnSuggestDifficultyAsync(client, tsRequest);
+                        await OnSuggestDifficultyAsync(connection, tsRequest);
                         break;
 
                     case BitcoinStratumMethods.MiningConfigure:
-                        await OnConfigureMiningAsync(client, tsRequest);
+                        await OnConfigureMiningAsync(connection, tsRequest);
                         // ignored
                         break;
 
                     case BitcoinStratumMethods.ExtraNonceSubscribe:
-                        await client.RespondAsync(true, request.Id);
+                        await connection.RespondAsync(true, request.Id);
                         break;
 
                     case BitcoinStratumMethods.GetTransactions:
@@ -481,22 +487,22 @@ namespace Miningcore.Blockchain.Bitcoin
                         break;
 
                     default:
-                        logger.Debug(() => $"[{client.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
+                        logger.Debug(() => $"[{connection.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
 
-                        await client.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
+                        await connection.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
                         break;
                 }
             }
 
             catch(StratumException ex)
             {
-                await client.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
+                await connection.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
             }
         }
 
-        protected override async Task OnVarDiffUpdateAsync(StratumClient client, double newDiff)
+        protected override async Task OnVarDiffUpdateAsync(StratumConnection connection, double newDiff)
         {
-            var context = client.ContextAs<BitcoinWorkerContext>();
+            var context = connection.ContextAs<BitcoinWorkerContext>();
             context.EnqueueNewDifficulty(newDiff);
 
             // apply immediately and notify client
@@ -504,8 +510,8 @@ namespace Miningcore.Blockchain.Bitcoin
             {
                 context.ApplyPendingDifficulty();
 
-                await client.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
-                await client.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
+                await connection.NotifyAsync(BitcoinStratumMethods.SetDifficulty, new object[] { context.Difficulty });
+                await connection.NotifyAsync(BitcoinStratumMethods.MiningNotify, currentJobParams);
             }
         }
 

@@ -1,23 +1,3 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
 using System.Globalization;
 using System.Reactive;
@@ -33,6 +13,8 @@ using Miningcore.Configuration;
 using Miningcore.JsonRpc;
 using Miningcore.Messaging;
 using Miningcore.Mining;
+using Miningcore.Nicehash;
+using Miningcore.Nicehash.API;
 using Miningcore.Notifications.Messages;
 using Miningcore.Payments;
 using Miningcore.Persistence;
@@ -52,19 +34,21 @@ namespace Miningcore.Blockchain.Cryptonote
             IStatsRepository statsRepo,
             IMapper mapper,
             IMasterClock clock,
-            IMessageBus messageBus) :
-            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus)
+            IMessageBus messageBus,
+            NicehashService nicehashService) :
+            base(ctx, serializerSettings, cf, statsRepo, mapper, clock, messageBus, nicehashService)
         {
         }
 
         private long currentJobId;
 
         private CryptonoteJobManager manager;
+        private string minerAlgo;
 
-        private async Task OnLoginAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnLoginAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
@@ -86,14 +70,14 @@ namespace Miningcore.Blockchain.Cryptonote
             var index = context.Miner.IndexOf('#');
             if(index != -1)
             {
-                var paymentId = context.Miner.Substring(index + 1).Trim();
+                var paymentId = context.Miner[(index + 1)..].Trim();
 
                 // validate
                 if(!string.IsNullOrEmpty(paymentId) && paymentId.Length != CryptonoteConstants.PaymentIdHexLength)
                     throw new StratumException(StratumError.MinusOne, "invalid payment id");
 
                 // re-append to address
-                addressToValidate = context.Miner.Substring(0, index).Trim();
+                addressToValidate = context.Miner[..index].Trim();
                 context.Miner = addressToValidate + PayoutConstants.PayoutInfoSeperator + paymentId;
             }
 
@@ -108,36 +92,59 @@ namespace Miningcore.Blockchain.Cryptonote
             // extract control vars from password
             var passParts = loginRequest.Password?.Split(PasswordControlVarsSeparator);
             var staticDiff = GetStaticDiffFromPassparts(passParts);
+
+            // Nicehash support
+            if(clusterConfig.Nicehash?.EnableAutoDiff == true &&
+               context.UserAgent.Contains(NicehashConstants.NicehashUA, StringComparison.OrdinalIgnoreCase))
+            {
+                // query current diff
+                var nicehashDiff = await nicehashService.GetStaticDiff(manager.Coin.Name, manager.Coin.GetAlgorithmName(), CancellationToken.None);
+
+                if(nicehashDiff.HasValue)
+                {
+                    if(!staticDiff.HasValue || nicehashDiff > staticDiff)
+                    {
+                        logger.Info(() => $"[{connection.ConnectionId}] Nicehash detected. Using API supplied difficulty of {nicehashDiff.Value}");
+
+                        staticDiff = nicehashDiff;
+                    }
+
+                    else
+                        logger.Info(() => $"[{connection.ConnectionId}] Nicehash detected. Using custom difficulty of {staticDiff.Value}");
+                }
+            }
+
+            // Static diff
             if(staticDiff.HasValue &&
-                (context.VarDiff != null && staticDiff.Value >= context.VarDiff.Config.MinDiff ||
-                    context.VarDiff == null && staticDiff.Value > context.Difficulty))
+               (context.VarDiff != null && staticDiff.Value >= context.VarDiff.Config.MinDiff ||
+                context.VarDiff == null && staticDiff.Value > context.Difficulty))
             {
                 context.VarDiff = null; // disable vardiff
                 context.SetDifficulty(staticDiff.Value);
 
-                logger.Info(() => $"[{client.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
+                logger.Info(() => $"[{connection.ConnectionId}] Static difficulty set to {staticDiff.Value}");
             }
 
             // respond
             var loginResponse = new CryptonoteLoginResponse
             {
-                Id = client.ConnectionId,
-                Job = CreateWorkerJob(client)
+                Id = connection.ConnectionId,
+                Job = CreateWorkerJob(connection)
             };
 
-            await client.RespondAsync(loginResponse, request.Id);
+            await connection.RespondAsync(loginResponse, request.Id);
 
             // log association
             if(!string.IsNullOrEmpty(context.Worker))
-                logger.Info(() => $"[{client.ConnectionId}] Authorized worker {context.Worker}@{context.Miner}");
+                logger.Info(() => $"[{connection.ConnectionId}] Authorized worker {context.Worker}@{context.Miner}");
             else
-                logger.Info(() => $"[{client.ConnectionId}] Authorized miner {context.Miner}");
+                logger.Info(() => $"[{connection.ConnectionId}] Authorized miner {context.Miner}");
         }
 
-        private async Task OnGetJobAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest)
+        private async Task OnGetJobAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
 
             if(request.Id == null)
                 throw new StratumException(StratumError.MinusOne, "missing request id");
@@ -145,17 +152,17 @@ namespace Miningcore.Blockchain.Cryptonote
             var getJobRequest = request.ParamsAs<CryptonoteGetJobRequest>();
 
             // validate worker
-            if(client.ConnectionId != getJobRequest?.WorkerId || !context.IsAuthorized)
+            if(connection.ConnectionId != getJobRequest?.WorkerId || !context.IsAuthorized)
                 throw new StratumException(StratumError.MinusOne, "unauthorized");
 
             // respond
-            var job = CreateWorkerJob(client);
-            await client.RespondAsync(job, request.Id);
+            var job = CreateWorkerJob(connection);
+            await connection.RespondAsync(job, request.Id);
         }
 
-        private CryptonoteJobParams CreateWorkerJob(StratumClient client)
+        private CryptonoteJobParams CreateWorkerJob(StratumConnection connection)
         {
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
             var job = new CryptonoteWorkerJob(NextJobId(), context.Difficulty);
 
             manager.PrepareWorkerJob(job, out var blob, out var target);
@@ -170,7 +177,11 @@ namespace Miningcore.Blockchain.Cryptonote
                 Blob = blob,
                 Target = target,
                 Height = job.Height,
+                SeedHash = job.SeedHash,
             };
+
+            if(!string.IsNullOrEmpty(minerAlgo))
+                result.Algorithm = minerAlgo;
 
             // update context
             lock(context)
@@ -181,10 +192,10 @@ namespace Miningcore.Blockchain.Cryptonote
             return result;
         }
 
-        private async Task OnSubmitAsync(StratumClient client, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
+        private async Task OnSubmitAsync(StratumConnection connection, Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
 
             try
             {
@@ -196,7 +207,7 @@ namespace Miningcore.Blockchain.Cryptonote
 
                 if(requestAge > maxShareAge)
                 {
-                    logger.Warn(() => $"[{client.ConnectionId}] Dropping stale share submission request (server overloaded?)");
+                    logger.Warn(() => $"[{connection.ConnectionId}] Dropping stale share submission request (server overloaded?)");
                     return;
                 }
 
@@ -204,7 +215,7 @@ namespace Miningcore.Blockchain.Cryptonote
                 var submitRequest = request.ParamsAs<CryptonoteSubmitShareRequest>();
 
                 // validate worker
-                if(client.ConnectionId != submitRequest?.WorkerId || !context.IsAuthorized)
+                if(connection.ConnectionId != submitRequest?.WorkerId || !context.IsAuthorized)
                     throw new StratumException(StratumError.MinusOne, "unauthorized");
 
                 // recognize activity
@@ -221,28 +232,21 @@ namespace Miningcore.Blockchain.Cryptonote
                 }
 
                 // dupe check
-                var nonceLower = submitRequest.Nonce.ToLower();
+                if(!job.Submissions.TryAdd(submitRequest.Nonce, true))
+                    throw new StratumException(StratumError.MinusOne, "duplicate share");
 
-                lock(job)
-                {
-                    if(job.Submissions.Contains(nonceLower))
-                        throw new StratumException(StratumError.MinusOne, "duplicate share");
+                var poolEndpoint = poolConfig.Ports[connection.PoolEndpoint.Port];
 
-                    job.Submissions.Add(nonceLower);
-                }
-
-                var poolEndpoint = poolConfig.Ports[client.PoolEndpoint.Port];
-
-                var share = await manager.SubmitShareAsync(client, submitRequest, job, poolEndpoint.Difficulty, ct);
-                await client.RespondAsync(new CryptonoteResponseBase(), request.Id);
+                var share = await manager.SubmitShareAsync(connection, submitRequest, job, poolEndpoint.Difficulty, ct);
+                await connection.RespondAsync(new CryptonoteResponseBase(), request.Id);
 
                 // publish
-                messageBus.SendMessage(new ClientShare(client, share));
+                messageBus.SendMessage(new ClientShare(connection, share));
 
                 // telemetry
                 PublishTelemetry(TelemetryCategory.Share, clock.Now - tsRequest.Timestamp.UtcDateTime, true);
 
-                logger.Info(() => $"[{client.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty, 3)}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share accepted: D={Math.Round(share.Difficulty, 3)}");
 
                 // update pool stats
                 if(share.IsBlockCandidate)
@@ -250,7 +254,7 @@ namespace Miningcore.Blockchain.Cryptonote
 
                 // update client stats
                 context.Stats.ValidShares++;
-                await UpdateVarDiffAsync(client);
+                await UpdateVarDiffAsync(connection);
             }
 
             catch(StratumException ex)
@@ -260,10 +264,10 @@ namespace Miningcore.Blockchain.Cryptonote
 
                 // update client stats
                 context.Stats.InvalidShares++;
-                logger.Info(() => $"[{client.ConnectionId}] Share rejected: {ex.Message}");
+                logger.Info(() => $"[{connection.ConnectionId}] Share rejected: {ex.Message}");
 
                 // banning
-                ConsiderBan(client, context, poolConfig.Banning);
+                ConsiderBan(connection, context, poolConfig.Banning);
 
                 throw;
             }
@@ -278,7 +282,7 @@ namespace Miningcore.Blockchain.Cryptonote
         {
             logger.Info(() => "Broadcasting job");
 
-            var tasks = ForEachClient(async client =>
+            var tasks = ForEachConnection(async client =>
             {
                 if(!client.IsAlive)
                     return;
@@ -294,7 +298,7 @@ namespace Miningcore.Blockchain.Cryptonote
                         lastActivityAgo.TotalSeconds > poolConfig.ClientConnectionTimeout)
                     {
                         logger.Info(() => $"[[{client.ConnectionId}] Booting zombie-worker (idle-timeout exceeded)");
-                        DisconnectClient(client);
+                        CloseConnection(client);
                         return;
                     }
 
@@ -318,6 +322,8 @@ namespace Miningcore.Blockchain.Cryptonote
 
             if(poolConfig.EnableInternalStratum == true)
             {
+                minerAlgo = GetMinerAlgo();
+
                 disposables.Add(manager.Blocks
                     .Select(_ => Observable.FromAsync(async () =>
                     {
@@ -348,6 +354,17 @@ namespace Miningcore.Blockchain.Cryptonote
             }
         }
 
+        private string GetMinerAlgo()
+        {
+            switch(manager.Coin.Hash)
+            {
+                case CryptonightHashType.RandomX:
+                    return $"rx/{manager.Coin.HashVariant}";
+            }
+
+            return null;
+        }
+
         protected override async Task InitStatsAsync()
         {
             await base.InitStatsAsync();
@@ -360,26 +377,26 @@ namespace Miningcore.Blockchain.Cryptonote
             return new CryptonoteWorkerContext();
         }
 
-        protected override async Task OnRequestAsync(StratumClient client,
+        protected override async Task OnRequestAsync(StratumConnection connection,
             Timestamped<JsonRpcRequest> tsRequest, CancellationToken ct)
         {
             var request = tsRequest.Value;
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
 
             try
             {
                 switch(request.Method)
                 {
                     case CryptonoteStratumMethods.Login:
-                        await OnLoginAsync(client, tsRequest);
+                        await OnLoginAsync(connection, tsRequest);
                         break;
 
                     case CryptonoteStratumMethods.GetJob:
-                        await OnGetJobAsync(client, tsRequest);
+                        await OnGetJobAsync(connection, tsRequest);
                         break;
 
                     case CryptonoteStratumMethods.Submit:
-                        await OnSubmitAsync(client, tsRequest, ct);
+                        await OnSubmitAsync(connection, tsRequest, ct);
                         break;
 
                     case CryptonoteStratumMethods.KeepAlive:
@@ -388,16 +405,16 @@ namespace Miningcore.Blockchain.Cryptonote
                         break;
 
                     default:
-                        logger.Debug(() => $"[{client.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
+                        logger.Debug(() => $"[{connection.ConnectionId}] Unsupported RPC request: {JsonConvert.SerializeObject(request, serializerSettings)}");
 
-                        await client.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
+                        await connection.RespondErrorAsync(StratumError.Other, $"Unsupported request {request.Method}", request.Id);
                         break;
                 }
             }
 
             catch(StratumException ex)
             {
-                await client.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
+                await connection.RespondErrorAsync(ex.Code, ex.Message, request.Id, false);
             }
         }
 
@@ -407,20 +424,20 @@ namespace Miningcore.Blockchain.Cryptonote
             return result;
         }
 
-        protected override async Task OnVarDiffUpdateAsync(StratumClient client, double newDiff)
+        protected override async Task OnVarDiffUpdateAsync(StratumConnection connection, double newDiff)
         {
-            await base.OnVarDiffUpdateAsync(client, newDiff);
+            await base.OnVarDiffUpdateAsync(connection, newDiff);
 
             // apply immediately and notify client
-            var context = client.ContextAs<CryptonoteWorkerContext>();
+            var context = connection.ContextAs<CryptonoteWorkerContext>();
 
             if(context.HasPendingDifficulty)
             {
                 context.ApplyPendingDifficulty();
 
                 // re-send job
-                var job = CreateWorkerJob(client);
-                await client.NotifyAsync(CryptonoteStratumMethods.JobNotify, job);
+                var job = CreateWorkerJob(connection);
+                await connection.NotifyAsync(CryptonoteStratumMethods.JobNotify, job);
             }
         }
 

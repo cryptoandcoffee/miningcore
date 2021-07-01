@@ -1,25 +1,4 @@
-/*
-Copyright 2017 Coin Foundry (coinfoundry.org)
-Authors: Oliver Weichhold (oliver@weichhold.com)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-*/
-
 using System;
-using System.Linq;
 using System.Threading;
 using Miningcore.Blockchain.Cryptonote.DaemonResponses;
 using Miningcore.Configuration;
@@ -28,7 +7,6 @@ using Miningcore.Native;
 using Miningcore.Stratum;
 using Miningcore.Util;
 using NBitcoin.BouncyCastle.Math;
-using static Miningcore.Native.LibCryptonight;
 using Contract = Miningcore.Contracts.Contract;
 
 namespace Miningcore.Blockchain.Cryptonote
@@ -36,7 +14,7 @@ namespace Miningcore.Blockchain.Cryptonote
     public class CryptonoteJob
     {
         public CryptonoteJob(GetBlockTemplateResponse blockTemplate, byte[] instanceId, string jobId,
-            PoolConfig poolConfig, ClusterConfig clusterConfig, string prevHash)
+            CryptonoteCoinTemplate coin, PoolConfig poolConfig, ClusterConfig clusterConfig, string prevHash, string randomXRealm)
         {
             Contract.RequiresNonNull(blockTemplate, nameof(blockTemplate));
             Contract.RequiresNonNull(poolConfig, nameof(poolConfig));
@@ -44,39 +22,33 @@ namespace Miningcore.Blockchain.Cryptonote
             Contract.RequiresNonNull(instanceId, nameof(instanceId));
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(jobId), $"{nameof(jobId)} must not be empty");
 
-            coin = poolConfig.Template.As<CryptonoteCoinTemplate>();
             BlockTemplate = blockTemplate;
             PrepareBlobTemplate(instanceId);
             PrevHash = prevHash;
 
             switch(coin.Hash)
             {
-                case CryptonightHashType.Normal:
-                    hashFunc = LibCryptonight.Cryptonight;
-                    break;
-
-                case CryptonightHashType.Lite:
-                    hashFunc = LibCryptonight.CryptonightLight;
-                    break;
-
-                case CryptonightHashType.Heavy:
-                    hashFunc = LibCryptonight.CryptonightHeavy;
+                case CryptonightHashType.RandomX:
+                    hashFunc = ((seedHex, data, result, height) =>
+                    {
+                        LibRandomX.CalculateHash(randomXRealm, seedHex, data, result);
+                    });
                     break;
             }
         }
 
+        public delegate void HashFunc(string seedHex, ReadOnlySpan<byte> data, Span<byte> result, ulong height);
+
         private byte[] blobTemplate;
         private int extraNonce;
-        private readonly CryptonoteCoinTemplate coin;
-        private readonly LibCryptonight.CryptonightHash hashFunc;
+        private readonly HashFunc hashFunc;
 
         private void PrepareBlobTemplate(byte[] instanceId)
         {
             blobTemplate = BlockTemplate.Blob.HexToByteArray();
 
-            // inject instanceId at the end of the reserved area of the blob
-            var destOffset = (int) BlockTemplate.ReservedOffset + CryptonoteConstants.ExtraNonceSize;
-            Array.Copy(instanceId, 0, blobTemplate, destOffset, 3);
+            // inject instanceId
+            instanceId.CopyTo(blobTemplate, BlockTemplate.ReservedOffset + CryptonoteConstants.ExtraNonceSize);
         }
 
         private string EncodeBlob(uint workerExtraNonce)
@@ -84,14 +56,14 @@ namespace Miningcore.Blockchain.Cryptonote
             Span<byte> blob = stackalloc byte[blobTemplate.Length];
             blobTemplate.CopyTo(blob);
 
-            // inject extranonce (big-endian at the beginning of the reserved area of the blob)
-            var extraNonceBytes = BitConverter.GetBytes(workerExtraNonce.ToBigEndian());
-            extraNonceBytes.CopyTo(blob.Slice(BlockTemplate.ReservedOffset, extraNonceBytes.Length));
+            // inject extranonce (big-endian) at the beginning of the reserved area
+            var bytes = BitConverter.GetBytes(workerExtraNonce.ToBigEndian());
+            bytes.CopyTo(blob[BlockTemplate.ReservedOffset..]);
 
             return LibCryptonote.ConvertBlob(blob, blobTemplate.Length).ToHexString();
         }
 
-        private string EncodeTarget(double difficulty)
+        private string EncodeTarget(double difficulty, int size = 4)
         {
             var diff = BigInteger.ValueOf((long) (difficulty * 255d));
             var quotient = CryptonoteConstants.Diff1.Divide(diff).Multiply(BigInteger.ValueOf(255));
@@ -103,7 +75,7 @@ namespace Miningcore.Blockchain.Cryptonote
             if(padLength > 0)
                 bytes.CopyTo(padded.Slice(padLength, bytes.Length));
 
-            padded = padded.Slice(0, 4);
+            padded = padded[..size];
             padded.Reverse();
 
             return padded.ToHexString();
@@ -114,7 +86,7 @@ namespace Miningcore.Blockchain.Cryptonote
             // blockhash is computed from the converted blob data prefixed with its length
             Span<byte> block = stackalloc byte[blobConverted.Length + 1];
             block[0] = (byte) blobConverted.Length;
-            blobConverted.CopyTo(block.Slice(1));
+            blobConverted.CopyTo(block[1..]);
 
             LibCryptonote.CryptonightHashFast(block, result);
         }
@@ -128,6 +100,7 @@ namespace Miningcore.Blockchain.Cryptonote
         {
             workerJob.Height = BlockTemplate.Height;
             workerJob.ExtraNonce = (uint) Interlocked.Increment(ref extraNonce);
+            workerJob.SeedHash = BlockTemplate.SeedHash;
 
             if(extraNonce < 0)
                 extraNonce = 0;
@@ -136,7 +109,7 @@ namespace Miningcore.Blockchain.Cryptonote
             target = EncodeTarget(workerJob.Difficulty);
         }
 
-        public (Share Share, string BlobHex) ProcessShare(string nonce, uint workerExtraNonce, string workerHash, StratumClient worker)
+        public (Share Share, string BlobHex) ProcessShare(string nonce, uint workerExtraNonce, string workerHash, StratumConnection worker)
         {
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(nonce), $"{nameof(nonce)} must not be empty");
             Contract.Requires<ArgumentException>(!string.IsNullOrEmpty(workerHash), $"{nameof(workerHash)} must not be empty");
@@ -153,47 +126,21 @@ namespace Miningcore.Blockchain.Cryptonote
             blobTemplate.CopyTo(blob);
 
             // inject extranonce
-            var extraNonceBytes = BitConverter.GetBytes(workerExtraNonce.ToBigEndian());
-            extraNonceBytes.CopyTo(blob.Slice(BlockTemplate.ReservedOffset, extraNonceBytes.Length));
+            var bytes = BitConverter.GetBytes(workerExtraNonce.ToBigEndian());
+            bytes.CopyTo(blob[BlockTemplate.ReservedOffset..]);
 
             // inject nonce
-            var nonceBytes = nonce.HexToByteArray();
-            nonceBytes.CopyTo(blob.Slice(CryptonoteConstants.BlobNonceOffset, nonceBytes.Length));
+            bytes = nonce.HexToByteArray();
+            bytes.CopyTo(blob[CryptonoteConstants.BlobNonceOffset..]);
 
             // convert
             var blobConverted = LibCryptonote.ConvertBlob(blob, blobTemplate.Length);
             if(blobConverted == null)
                 throw new StratumException(StratumError.MinusOne, "malformed blob");
 
-            // determine variant
-            CryptonightVariant variant = CryptonightVariant.VARIANT_0;
-
-            if(coin.HashVariant != 0)
-                variant = (CryptonightVariant) coin.HashVariant;
-            else
-            {
-                switch(coin.Hash)
-                {
-                    case CryptonightHashType.Normal:
-                        variant = (blobConverted[0] >= 10) ? CryptonightVariant.VARIANT_4 :
-                            ((blobConverted[0] >= 8) ? CryptonightVariant.VARIANT_2 :
-                            ((blobConverted[0] == 7) ? CryptonightVariant.VARIANT_1 :
-                            CryptonightVariant.VARIANT_0));
-                        break;
-
-                    case CryptonightHashType.Lite:
-                        variant = CryptonightVariant.VARIANT_1;
-                        break;
-
-                    case CryptonightHashType.Heavy:
-                        variant = CryptonightVariant.VARIANT_0;
-                        break;
-                }
-            }
-
             // hash it
             Span<byte> headerHash = stackalloc byte[32];
-            hashFunc(blobConverted, headerHash, variant, BlockTemplate.Height);
+            hashFunc(BlockTemplate.SeedHash, blobConverted, headerHash, BlockTemplate.Height);
 
             var headerHashString = headerHash.ToHexString();
             if(headerHashString != workerHash)
