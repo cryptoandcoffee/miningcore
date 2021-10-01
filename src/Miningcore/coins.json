@@ -584,6 +584,25 @@
         "explorerTxLink": "https://ravencoin.network/tx/{0}",
         "explorerAccountLink": "https://ravencoin.network/address/{0}"
     },
+        "ravencoinlite": {
+        "name": "Ravencoinlite",
+        "symbol": "RVN",
+        "family": "bitcoin",
+        "coinbaseHasher": {
+            "hash": "sha256d"
+        },
+        "headerHasher": {
+            "hash": "x16r"
+        },
+        "blockHasher": {
+            "hash": "reverse",
+            "args": [ { "hash": "x16r" } ]
+        },
+        "shareMultiplier": 256,
+        "explorerBlockLink": "http://explorer.ravencoinlite.org/block/$hash$",
+        "explorerTxLink": "http://explorer.ravencoinlite.org/tx/{0}",
+        "explorerAccountLink": "http://explorer.ravencoinlite.org/address/{0}"
+    },
     "pigeoncoin": {
         "name": "Pigeoncoin",
         "symbol": "PGN",
