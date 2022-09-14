@@ -4,9 +4,7 @@
 #include "ethash.h"
 #include <stdio.h>
 
-#define ENABLE_SSE 0
-
-#if defined(_M_X64) && ENABLE_SSE
+#if defined(_M_X64) && HAVE_SSE2
 #include <smmintrin.h>
 #endif
 
@@ -25,7 +23,7 @@ typedef union node {
 	uint32_t words[NODE_WORDS];
 	uint64_t double_words[NODE_WORDS / 2];
 
-#if defined(_M_X64) && ENABLE_SSE
+#if defined(_M_X64) && HAVE_SSE2
 	__m128i xmm[NODE_WORDS/4];
 #endif
 

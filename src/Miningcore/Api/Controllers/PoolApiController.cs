@@ -1,5 +1,4 @@
 using Autofac;
-using AutoMapper;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Miningcore.Api.Extensions;
@@ -8,578 +7,670 @@ using Miningcore.Blockchain;
 using Miningcore.Configuration;
 using Miningcore.Extensions;
 using Miningcore.Mining;
-using Miningcore.Persistence;
 using Miningcore.Persistence.Model;
 using Miningcore.Persistence.Model.Projections;
 using Miningcore.Persistence.Repositories;
 using Miningcore.Time;
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
-using System.Linq;
 using System.Net;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc.ActionConstraints;
+using NLog;
 
-namespace Miningcore.Api.Controllers
+namespace Miningcore.Api.Controllers;
+
+[Route("api/pools")]
+[ApiController]
+public class PoolApiController : ApiControllerBase
 {
-    [Route("api/pools")]
-    [ApiController]
-    public class PoolApiController : ControllerBase
+    public PoolApiController(IComponentContext ctx, IActionDescriptorCollectionProvider _adcp) : base(ctx)
     {
-        public PoolApiController(IComponentContext ctx, IActionDescriptorCollectionProvider _adcp)
+        statsRepo = ctx.Resolve<IStatsRepository>();
+        blocksRepo = ctx.Resolve<IBlockRepository>();
+        minerRepo = ctx.Resolve<IMinerRepository>();
+        shareRepo = ctx.Resolve<IShareRepository>();
+        paymentsRepo = ctx.Resolve<IPaymentRepository>();
+        clock = ctx.Resolve<IMasterClock>();
+        pools = ctx.Resolve<ConcurrentDictionary<string, IMiningPool>>();
+        adcp = _adcp;
+    }
+
+    private readonly IStatsRepository statsRepo;
+    private readonly IBlockRepository blocksRepo;
+    private readonly IPaymentRepository paymentsRepo;
+    private readonly IMinerRepository minerRepo;
+    private readonly IShareRepository shareRepo;
+    private readonly IMasterClock clock;
+    private readonly IActionDescriptorCollectionProvider adcp;
+    private readonly ConcurrentDictionary<string, IMiningPool> pools;
+
+    private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+
+    #region Actions
+
+    [HttpGet]
+    public async Task<GetPoolsResponse> Get(CancellationToken ct)
+    {
+        var response = new GetPoolsResponse
         {
-            clusterConfig = ctx.Resolve<ClusterConfig>();
-            cf = ctx.Resolve<IConnectionFactory>();
-            statsRepo = ctx.Resolve<IStatsRepository>();
-            blocksRepo = ctx.Resolve<IBlockRepository>();
-            paymentsRepo = ctx.Resolve<IPaymentRepository>();
-            mapper = ctx.Resolve<IMapper>();
-            clock = ctx.Resolve<IMasterClock>();
-            pools = ctx.Resolve<ConcurrentDictionary<string, IMiningPool>>();
-            adcp = _adcp;
+            Pools = await Task.WhenAll(clusterConfig.Pools.Where(x => x.Enabled).Select(async config =>
+            {
+                // load stats
+                var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id, ct));
+
+                // get pool
+                pools.TryGetValue(config.Id, out var pool);
+
+                // map
+                var result = config.ToPoolInfo(mapper, stats, pool);
+
+                // enrich
+                result.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id, ct));
+                result.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, config.Id, ct));
+                result.LastPoolBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, config.Id));
+
+                var from = clock.Now.AddDays(-1);
+
+                var minersByHashrate = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15, ct));
+
+                result.TopMiners = minersByHashrate.Select(mapper.Map<MinerPerformanceStats>).ToArray();
+
+                return result;
+            }).ToArray())
+        };
+
+        return response;
+    }
+
+    [HttpGet("/api/help")]
+    public ActionResult GetHelp()
+    {
+        var tmp = adcp.ActionDescriptors.Items
+            .Where(x => x.AttributeRouteInfo != null)
+            .Select(x =>
+            {
+                // Get and pad http method
+                var method = x.ActionConstraints?.OfType<HttpMethodActionConstraint>().FirstOrDefault()?.HttpMethods.First();
+                method = $"{method,-5}";
+
+                return $"{method} -> {x.AttributeRouteInfo.Template}";
+            });
+
+        // convert curly braces
+        var result = string.Join("\n", tmp).Replace("{", "<").Replace("}", ">") + "\n";
+
+        return Content(result);
+    }
+
+    [HttpGet("/api/health-check")]
+    public ActionResult GetHealthCheck()
+    {
+        return Content("👍");
+    }
+
+    [HttpGet("{poolId}")]
+    public async Task<GetPoolResponse> GetPoolInfoAsync(string poolId, CancellationToken ct)
+    {
+        var pool = GetPool(poolId);
+
+        // load stats
+        var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id, ct));
+
+        // get pool
+        pools.TryGetValue(pool.Id, out var poolInstance);
+
+        var response = new GetPoolResponse
+        {
+            Pool = pool.ToPoolInfo(mapper, stats, poolInstance)
+        };
+
+        // enrich
+        response.Pool.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, pool.Id, ct));
+        response.Pool.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, pool.Id, ct));
+        response.Pool.LastPoolBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, pool.Id));
+
+        var from = clock.Now.AddDays(-1);
+
+        response.Pool.TopMiners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, from, 0, 15, ct)))
+            .Select(mapper.Map<MinerPerformanceStats>)
+            .ToArray();
+
+        return response;
+    }
+
+    [HttpGet("{poolId}/performance")]
+    public async Task<GetPoolStatsResponse> GetPoolPerformanceAsync(string poolId,
+        [FromQuery(Name = "r")] SampleRange range = SampleRange.Day,
+        [FromQuery(Name = "i")] SampleInterval interval = SampleInterval.Hour)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        // set range
+        var end = clock.Now;
+        DateTime start;
+
+        switch(range)
+        {
+            case SampleRange.Day:
+                start = end.AddDays(-1);
+                break;
+
+            case SampleRange.Month:
+                start = end.AddDays(-30);
+                break;
+
+            default:
+                throw new ApiException("invalid interval");
         }
 
-        private readonly ClusterConfig clusterConfig;
-        private readonly IConnectionFactory cf;
-        private readonly IStatsRepository statsRepo;
-        private readonly IBlockRepository blocksRepo;
-        private readonly IPaymentRepository paymentsRepo;
-        private readonly IMapper mapper;
-        private readonly IMasterClock clock;
-        private readonly IActionDescriptorCollectionProvider adcp;
-        private readonly ConcurrentDictionary<string, IMiningPool> pools;
+        var stats = await cf.Run(con => statsRepo.GetPoolPerformanceBetweenAsync(con, pool.Id, interval, start, end, ct));
 
-        #region Actions
-
-        [HttpGet]
-        public async Task<GetPoolsResponse> Get()
+        var response = new GetPoolStatsResponse
         {
-            var response = new GetPoolsResponse
+            Stats = stats.Select(mapper.Map<AggregatedPoolStats>).ToArray()
+        };
+
+        return response;
+    }
+
+    [HttpGet("{poolId}/miners")]
+    public async Task<MinerPerformanceStats[]> PagePoolMinersAsync(
+        string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        // set range
+        var end = clock.Now;
+        var start = end.AddDays(-1);
+
+        var miners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, start, page, pageSize, ct)))
+            .Select(mapper.Map<MinerPerformanceStats>)
+            .ToArray();
+
+        return miners;
+    }
+
+    [HttpGet("{poolId}/blocks")]
+    public async Task<Responses.Block[]> PagePoolBlocksAsync(
+        string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15, [FromQuery] BlockStatus[] state = null)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        var blockStates = state is { Length: > 0 } ?
+            state :
+            new[] { BlockStatus.Confirmed, BlockStatus.Pending, BlockStatus.Orphaned };
+
+        var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Block>)
+            .ToArray();
+
+        // enrich blocks
+        var blockInfobaseDict = pool.Template.ExplorerBlockLinks;
+
+        foreach(var block in blocks)
+        {
+            // compute infoLink
+            if(blockInfobaseDict != null)
             {
-                Pools = await Task.WhenAll(clusterConfig.Pools.Where(x => x.Enabled).Select(async config =>
+                blockInfobaseDict.TryGetValue(!string.IsNullOrEmpty(block.Type) ? block.Type : "block", out var blockInfobaseUrl);
+
+                if(!string.IsNullOrEmpty(blockInfobaseUrl))
                 {
-                    // load stats
-                    var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id));
-
-                    // get pool
-                    pools.TryGetValue(config.Id, out var pool);
-
-                    // map
-                    var result = config.ToPoolInfo(mapper, stats, pool);
-
-                    // enrich
-                    result.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id));
-                    result.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, config.Id));
-                    result.LastPoolBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, config.Id));
-
-                    var from = clock.Now.AddDays(-1);
-
-                    var minersByHashrate = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15));
-
-                    result.TopMiners = minersByHashrate.Select(mapper.Map<MinerPerformanceStats>).ToArray();
-
-                    return result;
-                }).ToArray())
-            };
-
-            return response;
-        }
-
-        [HttpGet("/api/help")]
-        public ActionResult GetHelp()
-        {
-            var tmp = adcp.ActionDescriptors.Items
-                .Select(x =>
-                {
-                    // Get and pad http method
-                    var method = x?.ActionConstraints?.OfType<HttpMethodActionConstraint>().FirstOrDefault()?.HttpMethods.First();
-                    method = $"{method,-5}";
-
-                    return $"{method} -> {x.AttributeRouteInfo.Template}";
-                });
-
-            // convert curly braces
-            var result = string.Join("\n", tmp).Replace("{", "<").Replace("}", ">") + "\n";
-
-            return Content(result);
-        }
-
-        [HttpGet("{poolId}")]
-        public async Task<GetPoolResponse> GetPoolInfoAsync(string poolId)
-        {
-            var pool = GetPool(poolId);
-
-            // load stats
-            var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id));
-
-            // get pool
-            pools.TryGetValue(pool.Id, out var poolInstance);
-
-            var response = new GetPoolResponse
-            {
-                Pool = pool.ToPoolInfo(mapper, stats, poolInstance)
-            };
-
-            // enrich
-            response.Pool.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, pool.Id));
-            response.Pool.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, pool.Id));
-            response.Pool.LastPoolBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, pool.Id));
-
-            var from = clock.Now.AddDays(-1);
-
-            response.Pool.TopMiners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(
-                    con, pool.Id, from, 0, 15)))
-                .Select(mapper.Map<MinerPerformanceStats>)
-                .ToArray();
-
-            return response;
-        }
-
-        [HttpGet("{poolId}/performance")]
-        public async Task<GetPoolStatsResponse> GetPoolPerformanceAsync(string poolId,
-            [FromQuery(Name = "r")] SampleRange range = SampleRange.Day,
-            [FromQuery(Name = "i")] SampleInterval interval = SampleInterval.Hour)
-        {
-            var pool = GetPool(poolId);
-
-            // set range
-            var end = clock.Now;
-            DateTime start;
-
-            switch(range)
-            {
-                case SampleRange.Day:
-                    start = end.AddDays(-1);
-                    break;
-
-                case SampleRange.Month:
-                    start = end.AddDays(-30);
-                    break;
-
-                default:
-                    throw new ApiException("invalid interval");
-            }
-
-            var stats = await cf.Run(con => statsRepo.GetPoolPerformanceBetweenAsync(
-                con, pool.Id, interval, start, end));
-
-            var response = new GetPoolStatsResponse
-            {
-                Stats = stats.Select(mapper.Map<AggregatedPoolStats>).ToArray()
-            };
-
-            return response;
-        }
-
-        [HttpGet("{poolId}/miners")]
-        public async Task<MinerPerformanceStats[]> PagePoolMinersAsync(
-            string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
-        {
-            var pool = GetPool(poolId);
-
-            // set range
-            var end = clock.Now;
-            var start = end.AddDays(-1);
-
-            var miners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(
-                    con, pool.Id, start, page, pageSize)))
-                .Select(mapper.Map<MinerPerformanceStats>)
-                .ToArray();
-
-            return miners;
-        }
-
-        [HttpGet("{poolId}/blocks")]
-        public async Task<Responses.Block[]> PagePoolBlocksAsync(
-            string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15, [FromQuery] BlockStatus[] state = null)
-        {
-            var pool = GetPool(poolId);
-
-            var blockStates = state != null && state.Length > 0 ?
-                state :
-                new[] { BlockStatus.Confirmed, BlockStatus.Pending, BlockStatus.Orphaned };
-
-            var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize)))
-                .Select(mapper.Map<Responses.Block>)
-                .ToArray();
-
-            // enrich blocks
-            var blockInfobaseDict = pool.Template.ExplorerBlockLinks;
-
-            foreach(var block in blocks)
-            {
-                // compute infoLink
-                if(blockInfobaseDict != null)
-                {
-                    blockInfobaseDict.TryGetValue(!string.IsNullOrEmpty(block.Type) ? block.Type : "block", out var blockInfobaseUrl);
-
-                    if(!string.IsNullOrEmpty(blockInfobaseUrl))
-                    {
-                        if(blockInfobaseUrl.Contains(CoinMetaData.BlockHeightPH))
-                            block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHeightPH, block.BlockHeight.ToString(CultureInfo.InvariantCulture));
-                        else if(blockInfobaseUrl.Contains(CoinMetaData.BlockHashPH) && !string.IsNullOrEmpty(block.Hash))
-                            block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHashPH, block.Hash);
-                    }
+                    if(blockInfobaseUrl.Contains(CoinMetaData.BlockHeightPH))
+                        block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHeightPH, block.BlockHeight.ToString(CultureInfo.InvariantCulture));
+                    else if(blockInfobaseUrl.Contains(CoinMetaData.BlockHashPH) && !string.IsNullOrEmpty(block.Hash))
+                        block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHashPH, block.Hash);
                 }
             }
-
-            return blocks;
         }
 
-        [HttpGet("/api/v2/pools/{poolId}/blocks")]
-        public async Task<PagedResultResponse<Responses.Block[]>> PagePoolBlocksV2Async(
-            string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15, [FromQuery] BlockStatus[] state = null)
+        return blocks;
+    }
+
+    [HttpGet("/api/v2/pools/{poolId}/blocks")]
+    public async Task<PagedResultResponse<Responses.Block[]>> PagePoolBlocksV2Async(
+        string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15, [FromQuery] BlockStatus[] state = null)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        var blockStates = state is { Length: > 0 } ?
+            state :
+            new[] { BlockStatus.Confirmed, BlockStatus.Pending, BlockStatus.Orphaned };
+
+        uint pageCount = (uint) Math.Floor((await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, poolId, ct))) / (double) pageSize);
+
+        var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Block>)
+            .ToArray();
+
+        // enrich blocks
+        var blockInfobaseDict = pool.Template.ExplorerBlockLinks;
+
+        foreach(var block in blocks)
         {
-            var pool = GetPool(poolId);
-
-            var blockStates = state != null && state.Length > 0 ?
-                state :
-                new[] { BlockStatus.Confirmed, BlockStatus.Pending, BlockStatus.Orphaned };
-
-            uint pageCount = (uint) Math.Floor((await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, poolId))) / (double) pageSize);
-
-            var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize)))
-                .Select(mapper.Map<Responses.Block>)
-                .ToArray();
-
-            // enrich blocks
-            var blockInfobaseDict = pool.Template.ExplorerBlockLinks;
-
-            foreach(var block in blocks)
+            // compute infoLink
+            if(blockInfobaseDict != null)
             {
-                // compute infoLink
-                if(blockInfobaseDict != null)
-                {
-                    blockInfobaseDict.TryGetValue(!string.IsNullOrEmpty(block.Type) ? block.Type : "block", out var blockInfobaseUrl);
+                blockInfobaseDict.TryGetValue(!string.IsNullOrEmpty(block.Type) ? block.Type : "block", out var blockInfobaseUrl);
 
-                    if(!string.IsNullOrEmpty(blockInfobaseUrl))
-                    {
-                        if(blockInfobaseUrl.Contains(CoinMetaData.BlockHeightPH))
-                            block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHeightPH, block.BlockHeight.ToString(CultureInfo.InvariantCulture));
-                        else if(blockInfobaseUrl.Contains(CoinMetaData.BlockHashPH) && !string.IsNullOrEmpty(block.Hash))
-                            block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHashPH, block.Hash);
-                    }
+                if(!string.IsNullOrEmpty(blockInfobaseUrl))
+                {
+                    if(blockInfobaseUrl.Contains(CoinMetaData.BlockHeightPH))
+                        block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHeightPH, block.BlockHeight.ToString(CultureInfo.InvariantCulture));
+                    else if(blockInfobaseUrl.Contains(CoinMetaData.BlockHashPH) && !string.IsNullOrEmpty(block.Hash))
+                        block.InfoLink = blockInfobaseUrl.Replace(CoinMetaData.BlockHashPH, block.Hash);
                 }
             }
-
-            var response = new PagedResultResponse<Responses.Block[]>(blocks, pageCount);
-            return response;
         }
 
-        [HttpGet("{poolId}/payments")]
-        public async Task<Responses.Payment[]> PagePoolPaymentsAsync(
-            string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
+        var response = new PagedResultResponse<Responses.Block[]>(blocks, pageCount);
+        return response;
+    }
+
+    [HttpGet("{poolId}/payments")]
+    public async Task<Responses.Payment[]> PagePoolPaymentsAsync(
+        string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
+                con, pool.Id, null, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Payment>)
+            .ToArray();
+
+        // enrich payments
+        var txInfobaseUrl = pool.Template.ExplorerTxLink;
+        var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+
+        foreach(var payment in payments)
         {
-            var pool = GetPool(poolId);
+            // compute transaction infoLink
+            if(!string.IsNullOrEmpty(txInfobaseUrl))
+                payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
 
-            var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
-                    con, pool.Id, null, page, pageSize)))
-                .Select(mapper.Map<Responses.Payment>)
-                .ToArray();
+            // pool wallet link
+            if(!string.IsNullOrEmpty(addressInfobaseUrl))
+                payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
+        }
 
-            // enrich payments
-            var txInfobaseUrl = pool.Template.ExplorerTxLink;
-            var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+        return payments;
+    }
 
-            foreach(var payment in payments)
+    [HttpGet("/api/v2/pools/{poolId}/payments")]
+    public async Task<PagedResultResponse<Responses.Payment[]>> PagePoolPaymentsV2Async(
+        string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetPaymentsCountAsync(con, poolId, null, ct))) / (double) pageSize);
+
+        var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
+                con, pool.Id, null, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Payment>)
+            .ToArray();
+
+        // enrich payments
+        var txInfobaseUrl = pool.Template.ExplorerTxLink;
+        var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+
+        foreach(var payment in payments)
+        {
+            // compute transaction infoLink
+            if(!string.IsNullOrEmpty(txInfobaseUrl))
+                payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
+
+            // pool wallet link
+            if(!string.IsNullOrEmpty(addressInfobaseUrl))
+                payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
+        }
+
+        var response = new PagedResultResponse<Responses.Payment[]>(payments, pageCount);
+        return response;
+    }
+
+    [HttpGet("{poolId}/miners/{address}")]
+    public async Task<Responses.MinerStats> GetMinerInfoAsync(
+        string poolId, string address, [FromQuery] SampleRange perfMode = SampleRange.Day)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        var statsResult = await cf.RunTx((con, tx) =>
+            statsRepo.GetMinerStatsAsync(con, tx, pool.Id, address, ct), true, IsolationLevel.Serializable);
+
+        Responses.MinerStats stats = null;
+
+        if(statsResult != null)
+        {
+            stats = mapper.Map<Responses.MinerStats>(statsResult);
+
+            // pre-multiply pending shares to cause less confusion with users
+            if(pool.Template.Family == CoinFamily.Bitcoin)
+                stats.PendingShares *= pool.Template.As<BitcoinTemplate>().ShareMultiplier;
+
+            // optional fields
+            if(statsResult.LastPayment != null)
             {
-                // compute transaction infoLink
-                if(!string.IsNullOrEmpty(txInfobaseUrl))
-                    payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
+                // Set timestamp of last payment
+                stats.LastPayment = statsResult.LastPayment.Created;
 
-                // pool wallet link
-                if(!string.IsNullOrEmpty(addressInfobaseUrl))
-                    payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
+                // Compute info link
+                var baseUrl = pool.Template.ExplorerTxLink;
+                if(!string.IsNullOrEmpty(baseUrl))
+                    stats.LastPaymentLink = string.Format(baseUrl, statsResult.LastPayment.TransactionConfirmationData);
             }
 
-            return payments;
+            stats.PerformanceSamples = await GetMinerPerformanceInternal(perfMode, pool, address, ct);
         }
 
-        [HttpGet("/api/v2/pools/{poolId}/payments")]
-        public async Task<PagedResultResponse<Responses.Payment[]>> PagePoolPaymentsV2Async(
-            string poolId, [FromQuery] int page, [FromQuery] int pageSize = 15)
+        return stats;
+    }
+
+    [HttpGet("{poolId}/miners/{address}/payments")]
+    public async Task<Responses.Payment[]> PageMinerPaymentsAsync(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Payment>)
+            .ToArray();
+
+        // enrich payments
+        var txInfobaseUrl = pool.Template.ExplorerTxLink;
+        var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+
+        foreach(var payment in payments)
         {
-            var pool = GetPool(poolId);
+            // compute transaction infoLink
+            if(!string.IsNullOrEmpty(txInfobaseUrl))
+                payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
 
-            uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetPaymentsCountAsync(con, poolId))) / (double) pageSize);
-
-            var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
-                    con, pool.Id, null, page, pageSize)))
-                .Select(mapper.Map<Responses.Payment>)
-                .ToArray();
-
-            // enrich payments
-            var txInfobaseUrl = pool.Template.ExplorerTxLink;
-            var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
-
-            foreach(var payment in payments)
-            {
-                // compute transaction infoLink
-                if(!string.IsNullOrEmpty(txInfobaseUrl))
-                    payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
-
-                // pool wallet link
-                if(!string.IsNullOrEmpty(addressInfobaseUrl))
-                    payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
-            }
-
-            var response = new PagedResultResponse<Responses.Payment[]>(payments, pageCount);
-            return response;
+            // pool wallet link
+            if(!string.IsNullOrEmpty(addressInfobaseUrl))
+                payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
         }
 
-        [HttpGet("{poolId}/miners/{address}")]
-        public async Task<Responses.MinerStats> GetMinerInfoAsync(
-            string poolId, string address, [FromQuery] SampleRange perfMode = SampleRange.Day)
+        return payments;
+    }
+
+    [HttpGet("/api/v2/pools/{poolId}/miners/{address}/payments")]
+    public async Task<PagedResultResponse<Responses.Payment[]>> PageMinerPaymentsV2Async(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetPaymentsCountAsync(con, poolId, address, ct))) / (double) pageSize);
+
+        var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.Payment>)
+            .ToArray();
+
+        // enrich payments
+        var txInfobaseUrl = pool.Template.ExplorerTxLink;
+        var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+
+        foreach(var payment in payments)
         {
-            var pool = GetPool(poolId);
+            // compute transaction infoLink
+            if(!string.IsNullOrEmpty(txInfobaseUrl))
+                payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
 
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            var statsResult = await cf.RunTx((con, tx) =>
-                statsRepo.GetMinerStatsAsync(con, tx, pool.Id, address), true, IsolationLevel.Serializable);
-
-            Responses.MinerStats stats = null;
-
-            if(statsResult != null)
-            {
-                stats = mapper.Map<Responses.MinerStats>(statsResult);
-
-                // optional fields
-                if(statsResult.LastPayment != null)
-                {
-                    // Set timestamp of last payment
-                    stats.LastPayment = statsResult.LastPayment.Created;
-
-                    // Compute info link
-                    var baseUrl = pool.Template.ExplorerTxLink;
-                    if(!string.IsNullOrEmpty(baseUrl))
-                        stats.LastPaymentLink = string.Format(baseUrl, statsResult.LastPayment.TransactionConfirmationData);
-                }
-
-                stats.PerformanceSamples = await GetMinerPerformanceInternal(perfMode, pool, address);
-            }
-
-            return stats;
+            // pool wallet link
+            if(!string.IsNullOrEmpty(addressInfobaseUrl))
+                payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
         }
 
-        [HttpGet("{poolId}/miners/{address}/payments")]
-        public async Task<Responses.Payment[]> PageMinerPaymentsAsync(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+        var response = new PagedResultResponse<Responses.Payment[]>(payments, pageCount);
+        return response;
+    }
+
+    [HttpGet("{poolId}/miners/{address}/balancechanges")]
+    public async Task<Responses.BalanceChange[]> PageMinerBalanceChangesAsync(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        var balanceChanges = (await cf.Run(con => paymentsRepo.PageBalanceChangesAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.BalanceChange>)
+            .ToArray();
+
+        return balanceChanges;
+    }
+
+    [HttpGet("/api/v2/pools/{poolId}/miners/{address}/balancechanges")]
+    public async Task<PagedResultResponse<Responses.BalanceChange[]>> PageMinerBalanceChangesV2Async(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetBalanceChangesCountAsync(con, poolId, address))) / (double) pageSize);
+
+        var balanceChanges = (await cf.Run(con => paymentsRepo.PageBalanceChangesAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .Select(mapper.Map<Responses.BalanceChange>)
+            .ToArray();
+
+        var response = new PagedResultResponse<Responses.BalanceChange[]>(balanceChanges, pageCount);
+        return response;
+    }
+
+    [HttpGet("{poolId}/miners/{address}/earnings/daily")]
+    public async Task<AmountByDate[]> PageMinerEarningsByDayAsync(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        var earnings = (await cf.Run(con => paymentsRepo.PageMinerPaymentsByDayAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .ToArray();
+
+        return earnings;
+    }
+
+    [HttpGet("/api/v2/pools/{poolId}/miners/{address}/earnings/daily")]
+    public async Task<PagedResultResponse<AmountByDate[]>> PageMinerEarningsByDayV2Async(
+        string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetMinerPaymentsByDayCountAsync(con, poolId, address))) / (double) pageSize);
+
+        var earnings = (await cf.Run(con => paymentsRepo.PageMinerPaymentsByDayAsync(
+                con, pool.Id, address, page, pageSize, ct)))
+            .ToArray();
+
+        var response = new PagedResultResponse<AmountByDate[]>(earnings, pageCount);
+        return response;
+    }
+
+    [HttpGet("{poolId}/miners/{address}/performance")]
+    public async Task<Responses.WorkerPerformanceStatsContainer[]> GetMinerPerformanceAsync(
+        string poolId, string address, [FromQuery] SampleRange mode = SampleRange.Day)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(pool.Template.Family == CoinFamily.Ethereum)
+            address = address.ToLower();
+
+        var result = await GetMinerPerformanceInternal(mode, pool, address, ct);
+
+        return result;
+    }
+
+    [HttpGet("{poolId}/miners/{address}/settings")]
+    public async Task<Responses.MinerSettings> GetMinerSettingsAsync(string poolId, string address)
+    {
+        var pool = GetPool(poolId);
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        var result = await cf.Run(con=> minerRepo.GetSettingsAsync(con, null, pool.Id, address));
+
+        if(result == null)
+            throw new ApiException("No settings found", HttpStatusCode.NotFound);
+
+        return mapper.Map<Responses.MinerSettings>(result);
+    }
+
+    [HttpPost("{poolId}/miners/{address}/settings")]
+    public async Task<Responses.MinerSettings> SetMinerSettingsAsync(string poolId, string address,
+        [FromBody] Requests.UpdateMinerSettingsRequest request, CancellationToken ct)
+    {
+        var pool = GetPool(poolId);
+
+        if(string.IsNullOrEmpty(address))
+            throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+
+        if(request?.Settings == null)
+            throw new ApiException("Invalid or missing settings", HttpStatusCode.BadRequest);
+
+        if(!IPAddress.TryParse(request.IpAddress, out var requestIp))
+            throw new ApiException("Invalid IP address", HttpStatusCode.BadRequest);
+
+        // fetch recent IPs
+        var ips = await cf.Run(con=> shareRepo.GetRecentyUsedIpAddressesAsync(con, null, poolId, address, ct));
+
+        // any known ips?
+        if(ips == null || ips.Length == 0)
+            throw new ApiException("Address not recently used for mining", HttpStatusCode.NotFound);
+
+        // match?
+        if(!ips.Any(x=> IPAddress.TryParse(x, out var ipAddress) && ipAddress.IsEqual(requestIp)))
+            throw new ApiException("None of the recently used IP addresses matches the request", HttpStatusCode.Forbidden);
+
+        // map settings
+        var mapped = mapper.Map<Persistence.Model.MinerSettings>(request.Settings);
+
+        // clamp limit
+        if(pool.PaymentProcessing != null)
+            mapped.PaymentThreshold = Math.Max(mapped.PaymentThreshold, pool.PaymentProcessing.MinimumPayment);
+
+        mapped.PoolId = pool.Id;
+        mapped.Address = address;
+
+        // finally update the settings
+        return await cf.RunTx(async (con, tx) =>
         {
-            var pool = GetPool(poolId);
+            await minerRepo.UpdateSettingsAsync(con, tx, mapped);
 
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+            logger.Info(()=> $"Updated settings for pool {pool.Id}, miner {address}");
 
-            var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .Select(mapper.Map<Responses.Payment>)
-                .ToArray();
+            var result = await minerRepo.GetSettingsAsync(con, tx, mapped.PoolId, mapped.Address);
+            return mapper.Map<Responses.MinerSettings>(result);
+        });
+    }
 
-            // enrich payments
-            var txInfobaseUrl = pool.Template.ExplorerTxLink;
-            var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+    #endregion // Actions
 
-            foreach(var payment in payments)
-            {
-                // compute transaction infoLink
-                if(!string.IsNullOrEmpty(txInfobaseUrl))
-                    payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
+    private async Task<Responses.WorkerPerformanceStatsContainer[]> GetMinerPerformanceInternal(
+        SampleRange mode, PoolConfig pool, string address, CancellationToken ct)
+    {
+        Persistence.Model.Projections.WorkerPerformanceStatsContainer[] stats = null;
+        var end = clock.Now;
+        DateTime start;
 
-                // pool wallet link
-                if(!string.IsNullOrEmpty(addressInfobaseUrl))
-                    payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
-            }
-
-            return payments;
-        }
-
-        [HttpGet("/api/v2/pools/{poolId}/miners/{address}/payments")]
-        public async Task<PagedResultResponse<Responses.Payment[]>> PageMinerPaymentsV2Async(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
+        switch(mode)
         {
-            var pool = GetPool(poolId);
+            case SampleRange.Hour:
+                end = end.AddSeconds(-end.Second);
 
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
+                start = end.AddHours(-1);
 
-            uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetPaymentsCountAsync(con, poolId, address))) / (double) pageSize);
+                stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenThreeMinutelyAsync(con, pool.Id, address, start, end, ct));
+                break;
 
-            var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .Select(mapper.Map<Responses.Payment>)
-                .ToArray();
+            case SampleRange.Day:
+                // set range
+                if(end.Minute < 30)
+                    end = end.AddHours(-1);
 
-            // enrich payments
-            var txInfobaseUrl = pool.Template.ExplorerTxLink;
-            var addressInfobaseUrl = pool.Template.ExplorerAccountLink;
+                end = end.AddMinutes(-end.Minute);
+                end = end.AddSeconds(-end.Second);
 
-            foreach(var payment in payments)
-            {
-                // compute transaction infoLink
-                if(!string.IsNullOrEmpty(txInfobaseUrl))
-                    payment.TransactionInfoLink = string.Format(txInfobaseUrl, payment.TransactionConfirmationData);
+                start = end.AddDays(-1);
 
-                // pool wallet link
-                if(!string.IsNullOrEmpty(addressInfobaseUrl))
-                    payment.AddressInfoLink = string.Format(addressInfobaseUrl, payment.Address);
-            }
+                stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenHourlyAsync(con, pool.Id, address, start, end, ct));
+                break;
 
-            var response = new PagedResultResponse<Responses.Payment[]>(payments, pageCount);
-            return response;
+            case SampleRange.Month:
+                if(end.Hour < 12)
+                    end = end.AddDays(-1);
+
+                end = end.Date;
+
+                // set range
+                start = end.AddMonths(-1);
+
+                stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenDailyAsync(con, pool.Id, address, start, end, ct));
+                break;
         }
 
-        [HttpGet("{poolId}/miners/{address}/balancechanges")]
-        public async Task<Responses.BalanceChange[]> PageMinerBalanceChangesAsync(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
-        {
-            var pool = GetPool(poolId);
-
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            var balanceChanges = (await cf.Run(con => paymentsRepo.PageBalanceChangesAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .Select(mapper.Map<Responses.BalanceChange>)
-                .ToArray();
-
-            return balanceChanges;
-        }
-
-        [HttpGet("/api/v2/pools/{poolId}/miners/{address}/balancechanges")]
-        public async Task<PagedResultResponse<Responses.BalanceChange[]>> PageMinerBalanceChangesV2Async(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
-        {
-            var pool = GetPool(poolId);
-
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetBalanceChangesCountAsync(con, poolId, address))) / (double) pageSize);
-
-            var balanceChanges = (await cf.Run(con => paymentsRepo.PageBalanceChangesAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .Select(mapper.Map<Responses.BalanceChange>)
-                .ToArray();
-
-            var response = new PagedResultResponse<Responses.BalanceChange[]>(balanceChanges, pageCount);
-            return response;
-        }
-
-        [HttpGet("{poolId}/miners/{address}/earnings/daily")]
-        public async Task<AmountByDate[]> PageMinerEarningsByDayAsync(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
-        {
-            var pool = GetPool(poolId);
-
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            var earnings = (await cf.Run(con => paymentsRepo.PageMinerPaymentsByDayAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .ToArray();
-
-            return earnings;
-        }
-
-        [HttpGet("/api/v2/pools/{poolId}/miners/{address}/earnings/daily")]
-        public async Task<PagedResultResponse<AmountByDate[]>> PageMinerEarningsByDayV2Async(
-            string poolId, string address, [FromQuery] int page, [FromQuery] int pageSize = 15)
-        {
-            var pool = GetPool(poolId);
-
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetMinerPaymentsByDayCountAsync(con, poolId, address))) / (double) pageSize);
-
-            var earnings = (await cf.Run(con => paymentsRepo.PageMinerPaymentsByDayAsync(
-                    con, pool.Id, address, page, pageSize)))
-                .ToArray();
-
-            var response = new PagedResultResponse<AmountByDate[]>(earnings, pageCount);
-            return response;
-        }
-
-        [HttpGet("{poolId}/miners/{address}/performance")]
-        public async Task<Responses.WorkerPerformanceStatsContainer[]> GetMinerPerformanceAsync(
-            string poolId, string address, [FromQuery] SampleRange mode = SampleRange.Day)
-        {
-            var pool = GetPool(poolId);
-
-            if(string.IsNullOrEmpty(address))
-                throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
-
-            var result = await GetMinerPerformanceInternal(mode, pool, address);
-
-            return result;
-        }
-
-        #endregion // Actions
-
-        private PoolConfig GetPool(string poolId)
-        {
-            if(string.IsNullOrEmpty(poolId))
-                throw new ApiException("Invalid pool id", HttpStatusCode.NotFound);
-
-            var pool = clusterConfig.Pools.FirstOrDefault(x => x.Id == poolId && x.Enabled);
-
-            if(pool == null)
-                throw new ApiException($"Unknown pool {poolId}", HttpStatusCode.NotFound);
-
-            return pool;
-        }
-
-        private async Task<Responses.WorkerPerformanceStatsContainer[]> GetMinerPerformanceInternal(
-            SampleRange mode, PoolConfig pool, string address)
-        {
-            Persistence.Model.Projections.WorkerPerformanceStatsContainer[] stats = null;
-            var end = clock.Now;
-            DateTime start;
-
-            switch(mode)
-            {
-                case SampleRange.Hour:
-                    end = end.AddSeconds(-end.Second);
-
-                    start = end.AddHours(-1);
-
-                    stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenThreeMinutelyAsync(con, pool.Id, address, start, end));
-                    break;
-
-                case SampleRange.Day:
-                    // set range
-                    if(end.Minute < 30)
-                        end = end.AddHours(-1);
-
-                    end = end.AddMinutes(-end.Minute);
-                    end = end.AddSeconds(-end.Second);
-
-                    start = end.AddDays(-1);
-
-                    stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenHourlyAsync(con, pool.Id, address, start, end));
-                    break;
-
-                case SampleRange.Month:
-                    if(end.Hour < 12)
-                        end = end.AddDays(-1);
-
-                    end = end.Date;
-
-                    // set range
-                    start = end.AddMonths(-1);
-
-                    stats = await cf.Run(con => statsRepo.GetMinerPerformanceBetweenDailyAsync(con, pool.Id, address, start, end));
-                    break;
-            }
-
-            // map
-            var result = mapper.Map<Responses.WorkerPerformanceStatsContainer[]>(stats);
-            return result;
-        }
+        // map
+        var result = mapper.Map<Responses.WorkerPerformanceStatsContainer[]>(stats);
+        return result;
     }
 }
